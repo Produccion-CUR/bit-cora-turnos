@@ -116,9 +116,15 @@ const turnoSiguiente = (fecha, turno) => {
 // ---------------------------------------------------------------------------
 function siguienteTurnoActivo(fecha, turno, turnosActivosKeys) {
   let s = turnoSiguiente(fecha, turno);
-  while (s && !turnosActivosKeys.includes(s.turno)) {
+  let intentos = 0;
+  // El ciclo T1→T2→T3 solo tiene 3 turnos posibles; si en 10 vueltas no
+  // encontramos ninguno activo, es que no hay ningún turno activo en el
+  // patrón (ej. el usuario desmarcó todos) — cortamos para no congelar la app.
+  while (s && !turnosActivosKeys.includes(s.turno) && intentos < 10) {
     s = turnoSiguiente(s.fecha, s.turno);
+    intentos++;
   }
+  if (!s || !turnosActivosKeys.includes(s.turno)) return null;
   return s;
 }
 
@@ -378,7 +384,6 @@ function SupervisorSelect({ area, value, onChange, supervisoresList }) {
     (s) => s.area === area || s.area === "Ambas"
   );
   const estaEnLista = filtrados.some((s) => s.nombre === value);
-  const [modoLibre, setModoLibre] = useState(!estaEnLista && !!value && filtrados.length > 0);
 
   if (filtrados.length === 0) {
     return (
@@ -394,42 +399,17 @@ function SupervisorSelect({ area, value, onChange, supervisoresList }) {
     );
   }
 
-  if (modoLibre) {
-    return (
-      <div className="space-y-1">
-        <input
-          className={inputBase}
-          placeholder="Escribe el nombre del supervisor"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-        <button type="button" onClick={() => { setModoLibre(false); onChange(""); }}
-          className="text-xs text-blue-600 underline">
-          ← Volver al listado de supervisores
-        </button>
-      </div>
-    );
-  }
-
   return (
-    <div className="flex items-start gap-2">
-      <div className="flex-1">
-        <select
-          className={inputBase}
-          value={estaEnLista ? value : ""}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">— Seleccionar supervisor —</option>
-          {filtrados.map((s) => (
-            <option key={s.id} value={s.nombre}>{s.nombre}</option>
-          ))}
-        </select>
-      </div>
-      <button type="button" onClick={() => { setModoLibre(true); }}
-        className="shrink-0 text-xs font-medium border border-slate-300 rounded-xl px-3 py-2.5 text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
-        ✏ Otro
-      </button>
-    </div>
+    <select
+      className={inputBase}
+      value={estaEnLista ? value : ""}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      <option value="">— Seleccionar supervisor —</option>
+      {filtrados.map((s) => (
+        <option key={s.id} value={s.nombre}>{s.nombre}</option>
+      ))}
+    </select>
   );
 }
 
@@ -483,6 +463,10 @@ const MATERIALES_SELECCION = [
 ];
 
 const MATERIALES_ENVASADO = ["Pallet Certificado", "Film Máquina", "Film Manual", "MTC Cajas", "MTC Bolsas"];
+// Insumos de Lavado que se rastrean como stock (igual patrón que Selección/
+// Envasado vía MaterialesTable + finMat_i), para que Insumos y Consumo y las
+// alertas de vencimiento puedan comparar Necesito vs. Tengo también aquí.
+const MATERIALES_LAVADO = ["Caja de Film Manual", "Paquete Bolsas Bins Transparentes"];
 
 // Dotación
 const DOTACION_GENERAL_SELECCION = [
@@ -1079,33 +1063,53 @@ function procesoDisplay(entry) {
 // directamente — autocompleta contra el maestro de 275 SKU — y muestra chips
 // de acceso rápido con los SKU que ya están programados para esa fecha/turno.
 // ---------------------------------------------------------------------------
-function SkuPicker({ value, onChange, sugeridos, label = "Código SKU", listId = "sku-options-global" }) {
-  const [texto, setTexto] = useState(value || "");
-  useEffect(() => { setTexto(value || ""); }, [value]);
-
+function SkuPicker({ value, onChange, sugeridos, label = "Código SKU" }) {
   const matActual = value ? skuMaterial(value) : null;
+  const [texto, setTexto] = useState(matActual ? `${matActual.sku} — ${matActual.producto}` : "");
+  const [abierto, setAbierto] = useState(false);
 
-  const commit = (raw) => {
-    const code = (raw || "").trim();
-    if (!code) { onChange(""); return; }
-    const exact = SKU_MATERIALES.find((s) => s.sku.toLowerCase() === code.toLowerCase());
-    if (exact) { onChange(exact.sku); setTexto(exact.sku); return; }
-    // El datalist en algunos navegadores antepone "código — producto"; intenta extraer el código
-    const soloCodigo = code.split(/[—\-–]\s/)[0].trim();
-    const porPrefijo = SKU_MATERIALES.find((s) => s.sku.toLowerCase() === soloCodigo.toLowerCase());
-    if (porPrefijo) { onChange(porPrefijo.sku); setTexto(porPrefijo.sku); return; }
-    onChange("");
+  useEffect(() => {
+    const mat = value ? skuMaterial(value) : null;
+    setTexto(mat ? `${mat.sku} — ${mat.producto}` : (value || ""));
+  }, [value]);
+
+  // Busca por código O por descripción (nombre del producto), sin importar
+  // mayúsculas/minúsculas. Muestra hasta 8 resultados.
+  const resultados = useMemo(() => {
+    const q = texto.trim().toLowerCase();
+    if (!q) return [];
+    return SKU_MATERIALES
+      .filter((s) => s.sku.toLowerCase().includes(q) || s.producto.toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [texto]);
+
+  const elegir = (mat) => {
+    onChange(mat.sku);
+    setTexto(`${mat.sku} — ${mat.producto}`);
+    setAbierto(false);
+  };
+
+  const onBlurInput = () => {
+    // pequeño retraso para que el click en una opción alcance a registrarse
+    // antes de cerrar la lista.
+    setTimeout(() => {
+      setAbierto(false);
+      // Si lo que quedó escrito no coincide con ningún SKU válido, limpia.
+      const exact = SKU_MATERIALES.find((s) => s.sku.toLowerCase() === texto.trim().toLowerCase());
+      if (exact) { onChange(exact.sku); setTexto(`${exact.sku} — ${exact.producto}`); return; }
+      if (!value) onChange("");
+    }, 150);
   };
 
   return (
-    <div>
+    <div className="relative">
       {sugeridos && sugeridos.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-2">
           {sugeridos.map((sku) => {
             const mat = skuMaterial(sku);
             const sel = value === sku;
             return (
-              <button key={sku} type="button" onClick={() => onChange(sku)}
+              <button key={sku} type="button" onClick={() => mat && elegir(mat)}
                 className={`text-xs rounded-full px-3 py-1 border font-medium transition-colors ${sel ? "bg-amber-500 text-white border-amber-500" : "bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100"}`}>
                 {sku}{mat ? ` · ${mat.producto}` : ""}
               </button>
@@ -1115,26 +1119,39 @@ function SkuPicker({ value, onChange, sugeridos, label = "Código SKU", listId =
       )}
       <label className="block text-xs font-medium text-slate-600 mb-1">{label}</label>
       <input
-        list={listId}
         className={inputBase}
-        placeholder="Escribe o pega el código (ej: T5-12-0351)"
+        placeholder="Escribe el código o el nombre del producto…"
         value={texto}
-        onChange={(e) => setTexto(e.target.value)}
-        onBlur={(e) => commit(e.target.value)}
+        onChange={(e) => { setTexto(e.target.value); setAbierto(true); onChange(""); }}
+        onFocus={() => setAbierto(true)}
+        onBlur={onBlurInput}
       />
-      <datalist id={listId}>
-        {SKU_MATERIALES.map((s) => (
-          <option key={s.sku} value={s.sku}>{s.producto}</option>
-        ))}
-      </datalist>
+      {abierto && resultados.length > 0 && (
+        <div className="absolute z-20 mt-1 w-full bg-white border border-slate-300 rounded-xl shadow-lg max-h-64 overflow-y-auto">
+          {resultados.map((s) => (
+            <button
+              key={s.sku}
+              type="button"
+              onMouseDown={(e) => e.preventDefault()} // evita que el blur se dispare antes del click
+              onClick={() => elegir(s)}
+              className="w-full text-left px-3 py-2 hover:bg-amber-50 border-b border-slate-100 last:border-0"
+            >
+              <div className="text-xs font-mono text-amber-700 font-semibold">{s.sku}</div>
+              <div className="text-sm text-slate-800 truncate">{s.producto}</div>
+            </button>
+          ))}
+        </div>
+      )}
+      {abierto && texto.trim() && resultados.length === 0 && (
+        <div className="absolute z-20 mt-1 w-full bg-white border border-slate-300 rounded-xl shadow-lg px-3 py-2 text-xs text-slate-400">
+          Sin resultados para "{texto}"
+        </div>
+      )}
       {value && matActual && (
         <p className="text-xs text-emerald-700 mt-1">✓ {matActual.producto}</p>
       )}
-      {value && !matActual && (
+      {!value && texto && !abierto && (
         <p className="text-xs text-red-600 mt-1">⚠ Código no encontrado en el maestro de SKU.</p>
-      )}
-      {!value && texto && (
-        <p className="text-xs text-slate-400 mt-1">Escribe el código exacto o elígelo de la lista.</p>
       )}
     </div>
   );
@@ -1332,6 +1349,108 @@ function calcFormatos(totalKg, item) {
 }
 
 // ---------------------------------------------------------------------------
+// ALERTAS DE VENCIMIENTO — aviso proactivo en la pantalla de Inicio cuando
+// algún insumo (Film, Fixo, Bolsas Bins) no va a alcanzar para hoy + mañana,
+// comparando lo programado en el Programa de producción contra el stock del
+// último cierre registrado. Es un aviso "a grandes rasgos": para el detalle
+// exacto de cuánto pedir según el turno, siempre está la pantalla de Insumos.
+// ---------------------------------------------------------------------------
+function useAlertasInsumos() {
+  const [programas]        = useSharedList("programa-records");
+  const [seleccionCierres] = useSharedList("seleccion-cierre-records");
+  const [envasadoCierres]  = useSharedList("envasado-cierre-records");
+  const [lavadoCierres]    = useSharedList("lavado-cierre-records");
+  const { config: insumosConfig } = useInsumosConfig();
+
+  return useMemo(() => {
+    const hoy = today();
+    const manana = nextDateISO(hoy);
+    const ventana = [hoy, manana];
+
+    let kgSeleccion = 0;
+    const turnosSel = new Set(), turnosEnv = new Set();
+    programas.forEach((p) => {
+      if (p.especie === "LAVADO" || !ventana.includes(p.fecha)) return;
+      const lk = p.lineaKey || p.linea;
+      const categoria = CATEGORIA_INSUMO_POR_LINEA[lk];
+      if (categoria === "seleccion") { kgSeleccion += num(p.cantidad); turnosSel.add(p.fecha + p.turno); }
+      else if (categoria === "envasado") { turnosEnv.add(p.fecha + p.turno); }
+    });
+    const nTurnosSel = turnosSel.size;
+    const nTurnosEnv = turnosEnv.size;
+    const pallets = kgSeleccion / KG_POR_PALLET_SELECCION;
+
+    const stockDe = (cierres) => {
+      const last = [...cierres].sort((a, b) => b.id - a.id)[0];
+      return last || {};
+    };
+    const stockPorNombre = (cierre, materiales) => {
+      const s = {};
+      materiales.forEach((m, i) => { s[m] = num(cierre[`finMat_${i}`]); });
+      return s;
+    };
+    const stockSel    = stockPorNombre(stockDe(seleccionCierres), MATERIALES_SELECCION);
+    const stockEnv     = stockPorNombre(stockDe(envasadoCierres), MATERIALES_ENVASADO);
+    const stockLavado  = stockPorNombre(stockDe(lavadoCierres), MATERIALES_LAVADO);
+    const ultimoLavado = stockDe(lavadoCierres);
+    const palletsBandejasLavado = totalPalletsManual(ultimoLavado, "pendientes");
+
+    const alertas = [];
+
+    if (nTurnosSel > 0) {
+      (insumosConfig.variable.seleccion || []).forEach((item) => {
+        const necesito = calcFormatos(pallets, item);
+        const tengo = stockSel[item.nombre];
+        if (tengo !== undefined && necesito > tengo) {
+          alertas.push({ area: "Selección", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
+        }
+      });
+      (insumosConfig.fijo.seleccion || []).forEach((item) => {
+        const necesito = item.cantXTurno * nTurnosSel;
+        const tengo = stockSel[item.nombre];
+        if (tengo !== undefined && necesito > tengo) {
+          alertas.push({ area: "Selección", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
+        }
+      });
+    }
+
+    if (nTurnosEnv > 0) {
+      (insumosConfig.fijo.envasado || []).forEach((item) => {
+        const necesito = item.cantXTurno * nTurnosEnv;
+        const tengo = stockEnv[item.nombre];
+        if (tengo !== undefined && necesito > tengo) {
+          alertas.push({ area: "Envasado", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
+        }
+      });
+    }
+
+    // Lavado de bandejas — usa el backlog de pallets pendientes (Variable) y
+    // los mismos turnos de Selección como referencia (Fijo), ya que Lavado
+    // no tiene su propia cantidad programada en el Programa de producción.
+    if (palletsBandejasLavado > 0) {
+      (insumosConfig.variable.lavado || []).forEach((item) => {
+        const necesito = calcFormatos(palletsBandejasLavado, item);
+        const tengo = stockLavado[item.nombre];
+        if (tengo !== undefined && necesito > tengo) {
+          alertas.push({ area: "Lavado de bandejas", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
+        }
+      });
+    }
+    if (nTurnosSel > 0) {
+      (insumosConfig.fijo.lavado || []).forEach((item) => {
+        const necesito = item.cantXTurno * nTurnosSel;
+        const tengo = stockLavado[item.nombre];
+        if (tengo !== undefined && necesito > tengo) {
+          alertas.push({ area: "Lavado de bandejas", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
+        }
+      });
+    }
+
+    return alertas;
+  }, [programas, seleccionCierres, envasadoCierres, lavadoCierres, insumosConfig]);
+}
+
+// ---------------------------------------------------------------------------
 // INSUMOS Y CONSUMO (pantalla)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -1362,6 +1481,9 @@ function RowInsumo({ item, kgTotal, stockMap }) {
         <div className="text-right text-xs shrink-0 space-y-0.5">
           <div className="text-slate-500">Solicitar:</div>
           <div className="text-base font-bold text-slate-900">{solicitar} {fmt}{solicitar !== 1 ? "s" : ""}</div>
+          {item.costoUnitario > 0 && (
+            <div className="text-slate-400">≈ ${fmtNum(solicitar * item.costoUnitario, 0)}</div>
+          )}
           {tengo !== null ? (
             <>
               <div><span className="text-slate-500">Tengo </span><b>{fmtNum(tengo, 2)}</b></div>
@@ -1402,6 +1524,9 @@ function RowFijo({ item, nTurnos, stockMap }) {
         <div className="text-right text-xs shrink-0 space-y-0.5">
           <div className="text-slate-500">Solicitar:</div>
           <div className="text-base font-bold text-slate-900">{solicitar} {fmt}{solicitar !== 1 ? "s" : ""}</div>
+          {item.costoUnitario > 0 && (
+            <div className="text-slate-400">≈ ${fmtNum(solicitar * item.costoUnitario, 0)}</div>
+          )}
           {tengo !== null ? (
             <>
               <div><span className="text-slate-500">Tengo </span><b>{typeof tengo === "number" ? fmtNum(tengo, 2) : tengo}</b></div>
@@ -1510,13 +1635,17 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
     : areaFiltro === "envasado" ? "Insumos · Envasado"
     : "Insumos y Consumo";
 
-  // Fechas que tienen programación relevante (para acceso rápido). Usa el
-  // mapa dinámico de categorías (no arrays hardcodeados) para que ninguna
-  // línea programada quede fuera y falten fechas en los chips.
+  // Fechas que tienen programación relevante (para acceso rápido). Solo se
+  // consideran la fecha de hoy y la de mañana (Insumos es para pedir lo que
+  // se necesita ahora, no para revisar programación futura lejana).
   const fechasConProg = useMemo(() => {
+    const hoy = today();
+    const manana = nextDateISO(hoy);
+    const candidatas = new Set([hoy, manana]);
     const fset = new Set();
     programas.forEach((p) => {
       if (p.especie === "LAVADO") return;
+      if (!candidatas.has(p.fecha)) return;
       const lk = p.lineaKey || p.linea;
       const categoria = CATEGORIA_INSUMO_POR_LINEA[lk];
       if (!categoria) return; // línea desconocida (no debería pasar, pero por seguridad)
@@ -1563,6 +1692,16 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
     const last = [...lavadoCierres].sort((a, b) => b.id - a.id)[0];
     if (!last) return 0;
     return totalPalletsManual(last, "pendientes");
+  }, [lavadoCierres]);
+
+  // Stock actual de Lavado (Film Manual, Bolsas Bins Transparentes) desde el
+  // último cierre — mismo patrón finMat_i que Selección/Envasado.
+  const stockLavado = useMemo(() => {
+    const last = [...lavadoCierres].sort((a, b) => b.id - a.id)[0];
+    if (!last) return {};
+    const s = {};
+    MATERIALES_LAVADO.forEach((m, i) => { s[m] = num(last[`finMat_${i}`]); });
+    return s;
   }, [lavadoCierres]);
 
   // ── Desglose de Selección y Envasado para la fecha/turnos seleccionados ───
@@ -1789,10 +1928,10 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
                 Pallets de bandejas pendientes (según el último cierre de Lavado registrado): <b>{palletsBandejasLavado}</b>
               </p>
               {(INSUMOS_VARIABLE.lavado || []).map((item) => (
-                <RowInsumo key={item.nombre} item={item} kgTotal={palletsBandejasLavado} stockMap={{}} />
+                <RowInsumo key={item.nombre} item={item} kgTotal={palletsBandejasLavado} stockMap={stockLavado} />
               ))}
             </Card>
-            <SeccionFijos areaKey="lavado" stockMap={{}} titulo="Lavado de bandejas" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} />
+            <SeccionFijos areaKey="lavado" stockMap={stockLavado} titulo="Lavado de bandejas" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} />
           </>
         )}
 
@@ -1892,10 +2031,10 @@ const AREAS_INSUMOS = [
 ];
 
 function vacioVariable() {
-  return { nombre: "", formato: "Caja", uniXFormato: 1, tasaBase: 1, base: 100, unidadBase: "Pallets", nota: "" };
+  return { nombre: "", formato: "Caja", uniXFormato: 1, tasaBase: 1, base: 100, unidadBase: "Pallets", costoUnitario: 0, nota: "" };
 }
 function vacioFijo() {
-  return { nombre: "", formato: "Caja", uniXFormato: 1, cantXTurno: 1, nota: "", unidadMostrar: "" };
+  return { nombre: "", formato: "Caja", uniXFormato: 1, cantXTurno: 1, costoUnitario: 0, nota: "", unidadMostrar: "" };
 }
 
 function InsumosConfigScreen({ onBack }) {
@@ -1918,7 +2057,7 @@ function InsumosConfigScreen({ onBack }) {
     const next = asegurarBorrador();
     const clone = JSON.parse(JSON.stringify(next));
     const arr = (tipo === "variable" ? clone.variable : clone.fijo)[areaSel];
-    arr[idx] = { ...arr[idx], [campo]: ["uniXFormato","tasaBase","base","cantXTurno"].includes(campo) ? num(valor) : valor };
+    arr[idx] = { ...arr[idx], [campo]: ["uniXFormato","tasaBase","base","cantXTurno","costoUnitario"].includes(campo) ? num(valor) : valor };
     setBorrador(clone);
   };
 
@@ -2078,6 +2217,17 @@ function InsumosConfigScreen({ onBack }) {
                   )}
 
                   <div>
+                    <label className="block text-xs text-slate-500 mb-1">Costo por {item.formato || "unidad"} ($)</label>
+                    <input
+                      type="number"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm"
+                      placeholder="0"
+                      value={item.costoUnitario || ""}
+                      onChange={(e) => actualizarCampo(idx, "costoUnitario", e.target.value)}
+                    />
+                  </div>
+
+                  <div>
                     <label className="block text-xs text-slate-500 mb-1">Nota / explicación</label>
                     <input
                       className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm"
@@ -2097,6 +2247,10 @@ function InsumosConfigScreen({ onBack }) {
           </Card>
         )}
 
+        <p className="text-xs text-slate-400 px-1">
+          El costo se usa para estimar el gasto en insumos por turno. Si no conoces el precio exacto, déjalo en 0 — no afecta el cálculo de cantidades.
+        </p>
+
         <div className="flex gap-2">
           <button onClick={guardar}
             className="flex-1 flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-white font-semibold rounded-xl py-3 transition-colors text-sm">
@@ -2109,6 +2263,98 @@ function InsumosConfigScreen({ onBack }) {
         </div>
         <p className="text-xs text-slate-400 text-center">
           "Formatos necesarios" / "Por cada" + "Unidad" define la tasa: ej. 1 rollo cada 32 Pallets.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CALCULADORA DE COSTOS (Jefe de producción)
+// Herramienta de estimación rápida: el Jefe ingresa Kg a procesar (Selección)
+// y/o turnos a cubrir, y la calculadora usa las mismas tasas y costos
+// unitarios configurados en "Configurar Insumos" para estimar el gasto total.
+// No guarda nada — es solo para simular escenarios ("¿cuánto me costaría
+// procesar 5.000 Kg en 2 turnos?").
+// ---------------------------------------------------------------------------
+function CalculadoraCostosScreen({ onBack }) {
+  const { config, loading } = useInsumosConfig();
+  const [area, setArea] = useState("seleccion");
+  const [kg, setKg] = useState("");
+  const [nTurnos, setNTurnos] = useState("1");
+
+  const kgNum = num(kg);
+  const turnosNum = Math.max(1, num(nTurnos) || 1);
+  const pallets = area === "seleccion" || area === "lavado" ? kgNum / KG_POR_PALLET_SELECCION : 0;
+
+  const detalle = useMemo(() => {
+    const items = [];
+    (config.variable[area] || []).forEach((item) => {
+      if (!item.costoUnitario) return;
+      const formatos = pallets > 0 ? calcFormatos(pallets, item) : 0;
+      const solicitar = Math.ceil(formatos - 1e-9);
+      if (solicitar > 0) items.push({ nombre: item.nombre, cantidad: solicitar, formato: item.formato, costo: solicitar * item.costoUnitario });
+    });
+    (config.fijo[area] || []).forEach((item) => {
+      if (!item.costoUnitario) return;
+      const necesito = item.cantXTurno * turnosNum;
+      const solicitar = Math.ceil(necesito - 1e-9);
+      if (solicitar > 0) items.push({ nombre: item.nombre, cantidad: solicitar, formato: item.formato, costo: solicitar * item.costoUnitario });
+    });
+    return items;
+  }, [config, area, pallets, turnosNum]);
+
+  const totalEstimado = detalle.reduce((s, d) => s + d.costo, 0);
+  const sinCostos = detalle.length === 0 && (kgNum > 0 || turnosNum > 0);
+
+  return (
+    <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
+      <TopBar title="Calculadora de Costos" subtitle="Estimación rápida de gasto en insumos" onBack={onBack} icon={CheckCircle2} accent="emerald" />
+      <div className="px-4 pt-4 space-y-4">
+
+        <Card title="Escenario a estimar">
+          <div className="flex gap-1.5 mb-3">
+            {AREAS_INSUMOS.map((a) => (
+              <button key={a.key} onClick={() => setArea(a.key)}
+                className={`text-xs rounded-full px-3 py-1.5 border font-medium transition-colors ${area === a.key ? "bg-slate-800 text-white border-slate-800" : "border-slate-300 text-slate-600 hover:border-slate-500"}`}>
+                {a.label}
+              </button>
+            ))}
+          </div>
+          {(area === "seleccion" || area === "lavado") && (
+            <div className="mb-3">
+              <NumField label="Kg a procesar" value={kg} onChange={setKg} unit="Kg" />
+            </div>
+          )}
+          <NumField label="Turnos a cubrir" value={nTurnos} onChange={setNTurnos} />
+        </Card>
+
+        {loading ? <Loader /> : (
+          <Card title="Estimación">
+            {detalle.length === 0 ? (
+              <EmptyNote text={sinCostos ? "Ninguno de los insumos de esta área tiene costo unitario configurado todavía (Configurar Insumos)." : "Ingresa Kg y/o turnos para ver la estimación."} />
+            ) : (
+              <div className="space-y-2">
+                {detalle.map((d) => (
+                  <div key={d.nombre} className="flex justify-between items-center text-sm border-b border-slate-100 pb-1.5 last:border-0 last:pb-0">
+                    <div>
+                      <div className="font-medium text-slate-800">{d.nombre}</div>
+                      <div className="text-xs text-slate-400">{d.cantidad} {d.formato}{d.cantidad !== 1 ? "s" : ""}</div>
+                    </div>
+                    <div className="font-semibold text-slate-900">${fmtNum(d.costo, 0)}</div>
+                  </div>
+                ))}
+                <div className="flex justify-between items-center pt-2 mt-2 border-t border-slate-300">
+                  <span className="text-sm font-bold text-slate-800">Total estimado</span>
+                  <span className="text-lg font-bold text-emerald-700">${fmtNum(totalEstimado, 0)}</span>
+                </div>
+              </div>
+            )}
+          </Card>
+        )}
+
+        <p className="text-xs text-slate-400 text-center">
+          Esta calculadora no guarda nada — solo simula un escenario usando los costos unitarios de "Configurar Insumos".
         </p>
       </div>
     </div>
@@ -2184,12 +2430,17 @@ function EspecificacionScreen({ onBack }) {
       <TopBar title="Especificación de SKU" subtitle="Materiales, codificaciones y configuración de pallet" onBack={onBack} icon={Package} accent="amber" />
       <div className="px-4 pt-4 space-y-4">
 
+        <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3">
+          <p className="text-xs text-amber-800">
+            ⚠ Recordar validar esta información con las Especificaciones de Producto administradas por el Área de Calidad.
+          </p>
+        </div>
+
         <Card title="Buscar SKU">
           <SkuPicker
-            label="Código SKU"
+            label="Código SKU o descripción"
             value={skuSel}
             onChange={setSkuSel}
-            listId="sku-espec-consulta"
           />
         </Card>
 
@@ -2333,12 +2584,17 @@ function EspecificacionEditScreen({ onBack }) {
       <TopBar title="Editar Especificación SKU" subtitle="Jefe de producción — modificaciones al maestro" onBack={onBack} icon={Settings} accent="amber" />
       <div className="px-4 pt-4 space-y-4">
 
+        <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3">
+          <p className="text-xs text-amber-800">
+            ⚠ Recordar validar esta información con las Especificaciones de Producto administradas por el Área de Calidad.
+          </p>
+        </div>
+
         <Card title="Seleccionar SKU">
           <SkuPicker
-            label="Código SKU a editar"
+            label="Código SKU o descripción a editar"
             value={skuSel}
             onChange={setSkuSel}
-            listId="sku-espec-edit"
           />
           {conOverride && (
             <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5 mt-2">
@@ -2963,11 +3219,17 @@ function LavadoCierre({ values, setField }) {
       <Card title="Pallets pendientes por lavar" step={2}>
         <BandejaTable values={values} setField={setField} prefix="pendientes" soloPallets />
       </Card>
-      <Card title="Insumos" step={3}>
+      <Card title="Insumos consumidos este turno" step={3}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <NumField label="Rollos de film" value={values.rollosFilm} onChange={(v) => setField("rollosFilm", v)} unit="Rollos" />
           <NumField label="Bolsas de bins" value={values.bolsasBins} onChange={(v) => setField("bolsasBins", v)} unit="Paquetes" />
         </div>
+      </Card>
+      <Card title="Materiales piso planta (fin de turno)" step={4}>
+        <MaterialesTable items={MATERIALES_LAVADO} values={values} setField={setField} prefix="finMat" />
+        <p className="text-xs text-slate-400 mt-2">
+          Esto es lo que QUEDA disponible al cerrar el turno — se usa para calcular las alertas de vencimiento y "Tengo" en Insumos y Consumo.
+        </p>
       </Card>
       <ComentariosFields values={values} setField={setField} />
     </div>
@@ -3604,7 +3866,6 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
                   value={values.envasadora_sku}
                   onChange={(v) => setField("envasadora_sku", v)}
                   sugeridos={skusProgramadosTurno}
-                  listId="sku-options-inicio"
                 />
                 <CodificacionCard sku={values.envasadora_sku} />
                 <div className="pt-2 border-t border-slate-300">
@@ -3781,7 +4042,6 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
               value={values.envasadora_sku}
               onChange={(v) => setField("envasadora_sku", v)}
               sugeridos={skusProgramadosTurno}
-              listId="sku-options-cierre"
             />
           </div>
           <div className="mb-3">
@@ -4229,7 +4489,6 @@ function ProgramaProduccionScreen({ onBack }) {
                         label="Código SKU a programar"
                         value={draft.especie}
                         onChange={(v) => setDraftField("especie", v)}
-                        listId="sku-options-programa"
                       />
                     ) : (
                       <>
@@ -5820,6 +6079,8 @@ function EnvasadoPortal({ onNavigate, onBack, autor, setAutor, isJefe, onOpenLog
 
 // ── Home principal ───────────────────────────────────────────────────────────
 function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe }) {
+  const alertasInsumos = useAlertasInsumos();
+
   return (
     <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-8">
       <PortalHeader onOpenLogin={onOpenLogin} onLogoutJefe={onLogoutJefe} isJefe={isJefe} />
@@ -5833,6 +6094,39 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe }) {
         </h1>
         <p className="text-sm text-slate-500 mt-2">Selecciona el área de producción para comenzar.</p>
       </div>
+
+      {alertasInsumos.length > 0 && (() => {
+        // Agrupa por área para que el aviso especifique claramente a cuál
+        // sector pertenece cada quiebre/casi-quiebre.
+        const porArea = {};
+        alertasInsumos.forEach((a) => {
+          (porArea[a.area] = porArea[a.area] || []).push(a);
+        });
+        const areas = Object.keys(porArea);
+        return (
+          <div className="px-4 mb-4 space-y-2">
+            {areas.map((areaNombre) => (
+              <button
+                key={areaNombre}
+                onClick={() => onNavigate(areaNombre === "Envasado" ? "insumos-envasado" : "insumos-seleccion")}
+                className="w-full text-left bg-red-50 border border-red-300 rounded-2xl px-4 py-3 flex items-start gap-3 hover:bg-red-100 transition-colors"
+              >
+                <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-bold text-red-800">
+                    {areaNombre}: {porArea[areaNombre].length} insumo{porArea[areaNombre].length > 1 ? "s" : ""} no va{porArea[areaNombre].length > 1 ? "n" : ""} a alcanzar para hoy/mañana
+                  </div>
+                  <div className="text-xs text-red-700 mt-0.5 truncate">
+                    {porArea[areaNombre].slice(0, 3).map((a) => a.nombre).join(" · ")}
+                    {porArea[areaNombre].length > 3 ? ` · +${porArea[areaNombre].length - 3} más` : ""}
+                  </div>
+                  <div className="text-xs text-red-600 mt-1 underline">Ver detalle en Insumos de {areaNombre} →</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        );
+      })()}
 
       <div className="px-4 space-y-3">
         {/* Dos botones grandes de área */}
@@ -5871,6 +6165,7 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe }) {
               { key: "horarios",         label: "Horarios de Turno",           desc: "Lunes a Sábado — minutos efectivos por turno", Icon: Clock },
               { key: "especies",         label: "Gestionar especies por línea",desc: "Agregar nuevos procesos/especies", Icon: Plus },
               { key: "insumos-config",   label: "Configurar Insumos",          desc: "Tasas de consumo de Selección, Lavado y Envasado", Icon: Boxes },
+              { key: "calculadora-costos", label: "Calculadora de Costos",     desc: "Estima el gasto en insumos para un escenario de Kg/turnos", Icon: CheckCircle2 },
               { key: "espec-jefe",       label: "Editar Especificación SKU",   desc: "Modifica materiales, codificaciones y config. de pallet", Icon: Settings },
             ].map(({ key, label, desc, Icon }) => (
               <button key={key} onClick={() => onNavigate(key)}
@@ -6002,6 +6297,7 @@ export default function App() {
       {screen === "programa" && isJefe && <ProgramaProduccionScreen onBack={() => setScreen("home")} />}
       {screen === "especies" && isJefe && <EspeciesPorLineaScreen onBack={() => setScreen("home")} />}
       {screen === "insumos-config"  && isJefe && <InsumosConfigScreen onBack={() => setScreen("home")} />}
+      {screen === "calculadora-costos" && isJefe && <CalculadoraCostosScreen onBack={() => setScreen("home")} />}
       {screen === "espec-jefe"      && isJefe && <EspecificacionEditScreen onBack={() => setScreen("home")} />}
       {screen === "supervisores"    && isJefe && <SupervisoresScreen onBack={() => setScreen("home")} />}
       {screen === "horarios"        && isJefe && <HorariosScreen onBack={() => setScreen("home")} />}
