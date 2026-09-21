@@ -1337,6 +1337,27 @@ function SkuPicker({ value, onChange, sugeridos, label = "Código SKU" }) {
 
 const CATEGORIAS_COMENTARIO = ["Producción", "Calidad", "Mantención", "Seguridad"];
 
+// Puede haber más de un incidente/accidente en el mismo turno, así que el
+// detalle se guarda como una lista (record.incAccList). Esta función además
+// da compatibilidad con cierres guardados antes de permitir varios (cuando
+// el detalle todavía vivía en 4 campos sueltos, uno por turno), y devuelve un
+// ítem vacío cuando se marcó "Sí" pero todavía no se ha cargado ningún
+// detalle, para que el formulario y el reporte siempre tengan algo que mostrar.
+function incidentesDeCierre(record) {
+  const hayEvento = record.huboIncidentes === "Sí" || record.huboAccidentes === "Sí";
+  if (!hayEvento) return [];
+  if (Array.isArray(record.incAccList) && record.incAccList.length > 0) return record.incAccList;
+  if (record.incAccNombre || record.incAccDescripcion || record.incAccDocHecha || record.incAccDocEntregada) {
+    return [{
+      nombre: record.incAccNombre || "",
+      descripcion: record.incAccDescripcion || "",
+      docHecha: record.incAccDocHecha || "",
+      docEntregada: record.incAccDocEntregada || "",
+    }];
+  }
+  return [{ nombre: "", descripcion: "", docHecha: "", docEntregada: "" }];
+}
+
 function buildResumenWhatsapp(area, record, inicio, programaEntries) {
   const ind = area.indicator;
   const valorInd = ind.compute(record);
@@ -1366,6 +1387,18 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries) {
   lineas.push("");
   lineas.push(`¿Incidentes? ${record.huboIncidentes || "—"}`);
   lineas.push(`¿Accidentes? ${record.huboAccidentes || "—"}`);
+  const incidentesLista = incidentesDeCierre(record);
+  if (incidentesLista.length > 0) {
+    lineas.push("");
+    lineas.push(incidentesLista.length > 1 ? "*Detalle de los incidentes/accidentes:*" : "*Detalle del incidente/accidente:*");
+    incidentesLista.forEach((it, i) => {
+      if (incidentesLista.length > 1) lineas.push(`_Caso ${i + 1}:_`);
+      lineas.push(`• Persona: ${it.nombre || "—"}`);
+      lineas.push(`• Qué pasó: ${it.descripcion || "—"}`);
+      lineas.push(`• Documentación hecha: ${it.docHecha || "—"}`);
+      lineas.push(`• Documentación entregada: ${it.docEntregada || "—"}`);
+    });
+  }
   return lineas.join("\n");
 }
 
@@ -3219,6 +3252,24 @@ const CATEGORIA_COLOR = {
 };
 
 function ComentariosFields({ values, setField }) {
+  // El cuadro de detalle (persona, descripción, documentación) se despliega
+  // apenas se marca "Sí" en Incidentes o en Accidentes. Puede haber más de un
+  // caso en el mismo turno, así que se guarda como lista (incAccList) y se
+  // puede agregar o quitar casos con los botones de abajo.
+  const hayEvento = values.huboIncidentes === "Sí" || values.huboAccidentes === "Sí";
+  const incidentesLista = incidentesDeCierre(values);
+
+  const actualizarIncidente = (idx, campo, val) => {
+    const nueva = incidentesLista.map((it, i) => (i === idx ? { ...it, [campo]: val } : it));
+    setField("incAccList", nueva);
+  };
+  const agregarIncidente = () => {
+    setField("incAccList", [...incidentesLista, { nombre: "", descripcion: "", docHecha: "", docEntregada: "" }]);
+  };
+  const quitarIncidente = (idx) => {
+    setField("incAccList", incidentesLista.filter((_, i) => i !== idx));
+  };
+
   return (
     <Card title="Comentarios del cierre">
       <div className="space-y-3">
@@ -3239,6 +3290,62 @@ function ComentariosFields({ values, setField }) {
         <SelectField label="¿Hubo incidentes en el turno?" value={values.huboIncidentes} onChange={(v) => setField("huboIncidentes", v)} options={SI_NO} />
         <SelectField label="¿Hubo accidentes en el turno?" value={values.huboAccidentes} onChange={(v) => setField("huboAccidentes", v)} options={SI_NO} />
       </div>
+      {hayEvento && (
+        <div className="mt-3 pt-3 border-t border-red-200 bg-red-50 -mx-4 -mb-4 px-4 pb-4 rounded-b-xl">
+          <p className="text-xs font-semibold text-red-700 mb-2 flex items-center gap-1.5">
+            <AlertTriangle size={14} /> Detalle del incidente / accidente
+          </p>
+          <div className="space-y-3">
+            {incidentesLista.map((it, idx) => (
+              <div key={idx} className="border border-red-200 bg-white rounded-lg p-3">
+                {incidentesLista.length > 1 && (
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-red-700">Caso {idx + 1}</span>
+                    <button
+                      type="button"
+                      onClick={() => quitarIncidente(idx)}
+                      className="text-xs text-red-600 hover:text-red-800 font-medium flex items-center gap-1"
+                    >
+                      <X size={13} /> Quitar
+                    </button>
+                  </div>
+                )}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <TextField
+                    label="Nombre y apellido de la persona"
+                    value={it.nombre}
+                    onChange={(v) => actualizarIncidente(idx, "nombre", v)}
+                  />
+                  <SelectField
+                    label="¿Se hizo la documentación?"
+                    value={it.docHecha}
+                    onChange={(v) => actualizarIncidente(idx, "docHecha", v)}
+                    options={SI_NO}
+                  />
+                  <TextAreaField
+                    label="¿Qué pasó? (breve descripción)"
+                    value={it.descripcion}
+                    onChange={(v) => actualizarIncidente(idx, "descripcion", v)}
+                  />
+                  <SelectField
+                    label="¿Se entregó la documentación?"
+                    value={it.docEntregada}
+                    onChange={(v) => actualizarIncidente(idx, "docEntregada", v)}
+                    options={SI_NO}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={agregarIncidente}
+            className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs font-semibold text-red-700 border border-red-300 border-dashed rounded-lg py-2 hover:bg-red-100"
+          >
+            <Plus size={14} /> Agregar otro incidente / accidente
+          </button>
+        </div>
+      )}
     </Card>
   );
 }
@@ -6077,14 +6184,24 @@ function JefeDashboard({ onBack }) {
   const incidentes = todosCierres.filter((c) => c.huboIncidentes === "Sí").length;
   const accidentes = todosCierres.filter((c) => c.huboAccidentes === "Sí").length;
 
-  const recientes = [
+  const cierresConArea = [
     ...lavado.cierres.map((c) => ({ ...c, area: "Lavado de bandejas" })),
     ...seleccion.cierres.map((c) => ({ ...c, area: "Selección" })),
     ...envasado.cierres.map((c) => ({ ...c, area: "Envasado" })),
-  ]
+  ];
+
+  const recientes = cierresConArea
     .filter((c) => c.estado === "Enviado")
     .sort((a, b) => new Date(b.fechaHoraCierre || 0) - new Date(a.fechaHoraCierre || 0))
     .slice(0, 8);
+
+  // Reporte de accidentes e incidentes — un registro por CADA caso cargado en
+  // Comentarios del cierre (puede haber más de uno por turno), con el detalle
+  // de persona, qué pasó, y seguimiento de la documentación.
+  const reporteAccIncidentes = cierresConArea
+    .filter((c) => c.huboIncidentes === "Sí" || c.huboAccidentes === "Sí")
+    .sort((a, b) => new Date(b.fechaHoraCierre || 0) - new Date(a.fechaHoraCierre || 0))
+    .flatMap((c) => incidentesDeCierre(c).map((it, i) => ({ ...c, ...it, itemIdx: i })));
 
   return (
     <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
@@ -6099,6 +6216,48 @@ function JefeDashboard({ onBack }) {
               <AlertTriangle size={16} /> Cierres con accidentes: {accidentes}
             </span>
           </div>
+        </Card>
+
+        <Card title={`Reporte de accidentes e incidentes (${reporteAccIncidentes.length})`}>
+          {reporteAccIncidentes.length === 0 ? (
+            <EmptyNote text="Sin incidentes ni accidentes registrados." />
+          ) : (
+            <div className="space-y-2">
+              {reporteAccIncidentes.map((c) => {
+                const tipos = [
+                  c.huboAccidentes === "Sí" ? "Accidente" : null,
+                  c.huboIncidentes === "Sí" ? "Incidente" : null,
+                ].filter(Boolean).join(" + ");
+                const docHecha = c.docHecha || "No";
+                const docEntregada = c.docEntregada || "No";
+                const pendiente = docHecha !== "Sí" || docEntregada !== "Sí";
+                return (
+                  <div
+                    key={`${c.area}-${c.id}-${c.itemIdx}`}
+                    className={`rounded-xl px-3 py-2.5 border ${pendiente ? "bg-red-50 border-red-200" : "bg-emerald-50 border-emerald-200"}`}
+                  >
+                    <div className="flex justify-between items-start gap-2">
+                      <span className="text-sm font-semibold text-slate-900">{tipos} · {c.area}</span>
+                      <span className="text-xs text-slate-600 shrink-0">{fmtFecha(c.fecha)} · {turnoLabel(c.turno)}</span>
+                    </div>
+                    <div className="text-xs text-slate-600 mt-1">Supervisor responsable: <b>{c.responsable || "—"}</b></div>
+                    <div className="text-xs text-slate-600">Persona involucrada: <b>{c.nombre || "—"}</b></div>
+                    {c.descripcion && (
+                      <div className="text-xs text-slate-600 mt-1">"{c.descripcion}"</div>
+                    )}
+                    <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs">
+                      <span className={docHecha === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>
+                        {docHecha === "Sí" ? "✓" : "⚠"} Documentación hecha: {docHecha}
+                      </span>
+                      <span className={docEntregada === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>
+                        {docEntregada === "Sí" ? "✓" : "⚠"} Documentación entregada: {docEntregada}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </Card>
 
         <MiniChart area={AREAS.lavado} inicio={lavado.inicio} cierres={lavado.cierres} />
