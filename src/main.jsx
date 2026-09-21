@@ -6,7 +6,7 @@ import App from "./App.jsx";
 // ── Google Sheets sync URL ──────────────────────────────────────────────────
 // Pega aquí la URL que te entrega Apps Script al implementar Code_Bitacora.gs
 // Ejemplo: "https://script.google.com/macros/s/AKfycb.../exec"
-window.__SHEETS_URL__ = "https://script.google.com/macros/s/AKfycbxjT0kYoffxpMcHGbydcRKU05JdSPzg7WEhIF_S3eO0AWux4qlSTvzg2ZZPq_r8iEG7/exec";
+window.__SHEETS_URL__ = "";
 
 // ── Storage polyfill (localStorage + sincronización con Google Sheets) ─────
 // - set(): guarda local Y envía al Sheet (si hay URL configurada).
@@ -18,14 +18,22 @@ window.storage = {
   async get(key, shared) {
     if (window.__SHEETS_URL__) {
       try {
-        const res = await fetch(`${window.__SHEETS_URL__}?key=${encodeURIComponent(key)}`);
+        // Si Google Apps Script está "frío" o la red está lenta, no dejamos
+        // esperando a la persona para siempre: después de 8s se corta el
+        // intento y se usa la copia local guardada en el celular/PC.
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const res = await fetch(`${window.__SHEETS_URL__}?key=${encodeURIComponent(key)}`, {
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
         const data = await res.json();
         if (data && data.ok && data.value !== null && data.value !== undefined) {
           localStorage.setItem(PREFIX + key, data.value);
           return { key, value: data.value, shared: !!shared };
         }
       } catch {
-        // sin internet o el Sheet no respondió — sigue con la copia local
+        // sin internet, el Sheet no respondió, o se agotó el tiempo — sigue con la copia local
       }
     }
     try {

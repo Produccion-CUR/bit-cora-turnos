@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Droplets, Filter, Package, ClipboardCheck, ClipboardList, BarChart3, Settings, X, Lock,
   Save, ArrowLeft, User, Loader2, CheckCircle2, AlertTriangle, Sun, Moon, Clock, Pencil,
   Trash2, LogOut, CalendarDays, Share2, Boxes, Plus, ChevronRight, BookOpen, ChevronDown,
-  Truck,
+  Truck, Camera,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
 } from "recharts";
+import html2canvas from "html2canvas";
 
 // ---------------------------------------------------------------------------
 // Constantes generales
@@ -561,6 +562,34 @@ function ultimoStockMateriales(inicioRecords, cierreRecords, materiales) {
   return s;
 }
 
+// Traduce las llaves de "materiales piso planta" (nombres crudos, tal como
+// los guarda MaterialesTable: "Film Máquina", "Fixo Azul"...) a los nombres
+// que usa la configuración de Insumos y Consumo ("Caja de Film Máquina",
+// "Caja de Fixo Azul"...), que son los que se comparan contra "Necesito"
+// tanto en Insumos y Consumo como en las Alertas de vencimiento del Inicio.
+// Sin esta traducción los nombres nunca calzan entre sí, y ni Insumos y
+// Consumo ni las alertas pueden saber cuánto stock real hay de cada insumo.
+function stockInsumosSeleccion(stockCrudo) {
+  const s = { ...stockCrudo };
+  s["Caja de Film Máquina"]        = s["Film Máquina"]           ?? null;
+  s["Caja de Film Manual"]         = s["Film Manual"]            ?? null;
+  s["Caja de Fixo Azul"]           = s["Fixo Azul"]              ?? null;
+  s["Caja de Fixo Café"]           = s["Fixo Café"]              ?? null;
+  s["Caja de Fixo Transparente"]   = s["Fixo Transparente"]      ?? null;
+  s["Paquete Bolsas Bins Transparentes"] = s["Bolsas Bins"] != null ? s["Bolsas Bins"] / 30 : null;
+  s["Pallet de bolsas 899"]        = s["Bolsas 899"] != null ? s["Bolsas 899"] / 12000 : null;
+  s["Pallet de bolsas 1744"]       = s["Bolsas 1744 (Totes)"] != null ? s["Bolsas 1744 (Totes)"] / 12000 : null;
+  s["Pallet de cajas (MTC)"]       = ((s["Pallet MTC1280"] || 0) + (s["Pallet MTC1310"] || 0)) || null;
+  return s;
+}
+
+function stockInsumosEnvasado(stockCrudo) {
+  const s = { ...stockCrudo };
+  s["Caja de Film Máquina"] = s["Film Máquina"] ?? null;
+  s["Caja de Film Manual"]  = s["Film Manual"]  ?? null;
+  s["Caja de Fixo Azul"]    = s["Fixo Azul"]    ?? null;
+  return s;
+}
 
 // ---------------------------------------------------------------------------
 // Datos maestros (basados en las planillas de la planta)
@@ -1513,8 +1542,8 @@ function useAlertasInsumos() {
     const nTurnosEnv = turnosEnv.size;
     const pallets = kgSeleccion / KG_POR_PALLET_SELECCION;
 
-    const stockSel    = ultimoStockMateriales(seleccionInicios, seleccionCierres, MATERIALES_SELECCION);
-    const stockEnv     = ultimoStockMateriales(envasadoInicios, envasadoCierres, MATERIALES_ENVASADO);
+    const stockSel    = stockInsumosSeleccion(ultimoStockMateriales(seleccionInicios, seleccionCierres, MATERIALES_SELECCION));
+    const stockEnv     = stockInsumosEnvasado(ultimoStockMateriales(envasadoInicios, envasadoCierres, MATERIALES_ENVASADO));
     const stockLavado  = ultimoStockMateriales(lavadoInicios, lavadoCierres, MATERIALES_LAVADO);
     // Pallets pendientes de lavar (backlog) solo se registra al Cierre, no
     // tiene equivalente en Inicio — se sigue tomando del último cierre.
@@ -1788,28 +1817,12 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
   // ese turno todavía no se haya cerrado) ──────────────────────────────────
   const stockSeleccion = useMemo(() => {
     const s = ultimoStockMateriales(seleccionInicios, seleccionCierres, MATERIALES_SELECCION);
-    if (Object.keys(s).length === 0) return s;
-    // Conversiones a las unidades de solicitud (para que RowInsumo/RowFijo
-    // pueda cruzar "Tengo" contra lo que hay en stock real del piso de planta).
-    s["Caja de Film Máquina"]        = s["Film Máquina"]           ?? null;
-    s["Caja de Film Manual"]         = s["Film Manual"]            ?? null;
-    s["Caja de Fixo Azul"]           = s["Fixo Azul"]              ?? null;
-    s["Caja de Fixo Café"]           = s["Fixo Café"]              ?? null;
-    s["Caja de Fixo Transparente"]   = s["Fixo Transparente"]      ?? null;
-    s["Paquete Bolsas Bins Transparentes"] = s["Bolsas Bins"] != null ? s["Bolsas Bins"] / 30 : null;
-    s["Pallet de bolsas 899"]        = s["Bolsas 899"] != null ? s["Bolsas 899"] / 12000 : null;
-    s["Pallet de bolsas 1744"]       = s["Bolsas 1744 (Totes)"] != null ? s["Bolsas 1744 (Totes)"] / 12000 : null;
-    s["Pallet de cajas (MTC)"]       = ((s["Pallet MTC1280"] || 0) + (s["Pallet MTC1310"] || 0)) || null;
-    return s;
+    return Object.keys(s).length === 0 ? s : stockInsumosSeleccion(s);
   }, [seleccionInicios, seleccionCierres]);
 
   const stockEnvasado = useMemo(() => {
     const s = ultimoStockMateriales(envasadoInicios, envasadoCierres, MATERIALES_ENVASADO);
-    if (Object.keys(s).length === 0) return s;
-    s["Caja de Film Máquina"] = s["Film Máquina"] ?? null;
-    s["Caja de Film Manual"]  = s["Film Manual"]  ?? null;
-    s["Caja de Fixo Azul"]    = s["Fixo Azul"]    ?? null;
-    return s;
+    return Object.keys(s).length === 0 ? s : stockInsumosEnvasado(s);
   }, [envasadoInicios, envasadoCierres]);
 
   // Pallets de bandejas pendientes según el último cierre de Lavado registrado
@@ -4422,6 +4435,12 @@ function ProgramaProduccionScreen({ onBack }) {
   const [fechaEnvioWA, setFechaEnvioWA] = useState(today());
   const [toast, setToast] = useState(null);
   const [toastObs, setToastObs] = useState(null);
+  // Con cuántos turnos se está trabajando esta semana — solo afecta qué
+  // columnas se muestran en "Vista general de la semana" (no borra ni oculta
+  // las entradas ya guardadas de un turno que se desmarque acá).
+  const [turnosVista, setTurnosVista] = useState({ T1: true, T2: true, T3: true });
+  const capturaRef = useRef(null);
+  const [compartiendoImagen, setCompartiendoImagen] = useState(false);
 
   useEffect(() => {
     setDraft((prev) => ({ ...prev, fecha: fechaInicio }));
@@ -4450,6 +4469,48 @@ function ProgramaProduccionScreen({ onBack }) {
   const observacionesVentana = slots
     .map((s) => observaciones.find((o) => o.fecha === s.fecha && o.turno === s.turno))
     .filter(Boolean);
+
+  // Solo para "Vista general de la semana": columnas de los turnos marcados
+  // como activos arriba. El resto de la pantalla (entradas, observaciones,
+  // WhatsApp) sigue considerando los 21 turnos completos.
+  const slotsVista = slots.filter((s) => turnosVista[s.turno]);
+
+  const handleCompartirImagen = async () => {
+    if (!capturaRef.current) return;
+    setCompartiendoImagen(true);
+    try {
+      const canvas = await html2canvas(capturaRef.current, { scale: 2, backgroundColor: "#ffffff" });
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("No se pudo generar la imagen.");
+      const file = new File([blob], `programa-semana-${fechaInicio}.png`, { type: "image/png" });
+      const texto = `Programa de producción — semana del ${fmtFechaCorta(mondayOfWeek(fechaInicio))}`;
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        // Móvil (Android/iPhone): abre el panel nativo de compartir — ahí se
+        // elige WhatsApp y la imagen queda adjunta, igual que una captura de
+        // pantalla común.
+        await navigator.share({ files: [file], title: "Programa de producción", text: texto });
+      } else {
+        // Escritorio u otro navegador sin soporte para compartir archivos:
+        // se descarga la imagen para adjuntarla manualmente en WhatsApp.
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `programa-semana-${fechaInicio}.png`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        setToast({ kind: "ok", message: "Imagen descargada — adjúntala manualmente en tu chat de WhatsApp." });
+      }
+    } catch (err) {
+      if (err?.name !== "AbortError") { // el usuario cerró el panel de compartir — no es un error real
+        setToast({ kind: "error", message: "No se pudo generar la imagen. Intenta nuevamente." });
+      }
+    } finally {
+      setCompartiendoImagen(false);
+    }
+  };
 
   // La observación se guarda para la fecha/turno que están seleccionados en
   // el formulario de "Agregar entrada al programa" — no es un formulario
@@ -4529,6 +4590,23 @@ function ProgramaProduccionScreen({ onBack }) {
         <Card title="Semana del programa" step={1}>
           <label className="block text-xs font-medium text-slate-600 mb-1">Fecha de referencia (se muestra la semana completa, Lunes a Domingo)</label>
           <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fechaInicio} onChange={(e) => setFechaInicio(e.target.value)} />
+
+          <label className="block text-xs font-medium text-slate-600 mt-3 mb-1">¿Con cuántos turnos se está trabajando esta semana?</label>
+          <p className="text-xs text-slate-400 mb-2">Define qué columnas se muestran en "Vista general de la semana" — no afecta las entradas ya guardadas.</p>
+          <div className="flex gap-2">
+            {TURNOS.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTurnosVista((prev) => ({ ...prev, [t.key]: !prev[t.key] }))}
+                className={`flex-1 text-xs font-semibold rounded-lg px-2 py-2 border transition-colors ${
+                  turnosVista[t.key] ? "bg-emerald-500/10 border-emerald-400 text-emerald-700" : "border-slate-300 text-slate-500 hover:border-slate-400"
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
         </Card>
 
         <Card title="Enviar Programa por WhatsApp">
@@ -4548,19 +4626,32 @@ function ProgramaProduccionScreen({ onBack }) {
           >
             <Share2 size={18} /> Enviar Programa de {fechaEnvioWA ? fmtFechaCorta(fechaEnvioWA) : "la fecha elegida"}
           </a>
+          <button
+            type="button"
+            onClick={handleCompartirImagen}
+            disabled={compartiendoImagen}
+            className="w-full mt-2 flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-white font-semibold rounded-xl py-3 transition-colors text-sm"
+          >
+            <Camera size={18} /> {compartiendoImagen ? "Generando imagen…" : "Compartir imagen (vista general + observaciones)"}
+          </button>
+          <p className="text-xs text-slate-400 mt-2">
+            En el celular abre el panel de compartir de WhatsApp con la imagen ya adjunta. En computador, la descarga para que la adjuntes tú.
+          </p>
+          {toast && <div className="mt-2"><Toast {...toast} /></div>}
         </Card>
 
         {loading ? (
           <Card><Loader /></Card>
         ) : (
           <>
+            <div ref={capturaRef} className="space-y-4 bg-white">
             <Card title="Vista general de la semana">
               <div className="overflow-x-auto -mx-4 px-4">
                 <table className="border-collapse text-[11px] min-w-[2300px]">
                   <thead>
                     <tr>
                       <th className="sticky left-0 z-10 bg-slate-100 border border-slate-300 px-2 py-1 text-left text-slate-600 min-w-[90px]">Línea</th>
-                      {slots.map((s, i) => (
+                      {slotsVista.map((s, i) => (
                         <th key={i} className="border border-slate-300 px-2 py-1 text-center min-w-[104px]">
                           <div className="text-slate-800 font-semibold">{diaCorto(s.fecha)}</div>
                           <div className="text-slate-600">{turnoLabel(s.turno)}</div>
@@ -4571,7 +4662,7 @@ function ProgramaProduccionScreen({ onBack }) {
                   </thead>
                   <tbody>
                     {programaLineas.map((linea) => {
-                      const filaEntries = slots.map((s) => (entriesPorSlot[slotKey(s)] || []).filter((e) => e.lineaKey === linea.key));
+                      const filaEntries = slotsVista.map((s) => (entriesPorSlot[slotKey(s)] || []).filter((e) => e.lineaKey === linea.key));
                       const metas = filaEntries.map((es) => es.filter((e) => e.especie !== "LAVADO").reduce((sum, e) => sum + num(e.cantidad), 0));
                       const cc = PROGRAMA_COLOR_CLASSES[linea.color] || PROGRAMA_COLOR_CLASSES.slate;
                       return (
@@ -4608,7 +4699,7 @@ function ProgramaProduccionScreen({ onBack }) {
                   </tbody>
                 </table>
               </div>
-              <p className="text-xs text-slate-500 mt-2">Desliza para ver los 21 turnos de la semana (Lunes a Domingo, T3/T1/T2). Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
+              <p className="text-xs text-slate-500 mt-2">Mostrando {slotsVista.length} de 21 turnos de la semana (Lunes a Domingo, T3/T1/T2) — ajusta arriba en "¿Con cuántos turnos se está trabajando?". Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
             </Card>
 
             {/* Observaciones por turno — tabla separada del schedule, no ocupa celdas de la grilla */}
@@ -4733,6 +4824,7 @@ function ProgramaProduccionScreen({ onBack }) {
                 </div>
               )}
             </Card>
+            </div>
 
             <Card title="Entradas de la semana" step={3}>
               {entriesVentana.length === 0 ? (
