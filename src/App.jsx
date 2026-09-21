@@ -201,22 +201,67 @@ async function saveToSheets(listKey, record) {
 // ---------------------------------------------------------------------------
 // Almacenamiento (compartido entre todas las personas que usan la app)
 // ---------------------------------------------------------------------------
+// CACHÉ EN MEMORIA (optimización de velocidad): cada pantalla que se abre
+// pedía SIEMPRE los datos de nuevo a Google Sheets (una petición de red por
+// cada lista, aunque otra pantalla los hubiera pedido hace 2 segundos). Con
+// varias listas por pantalla (Inicio pide 5), navegar se sentía lento.
+// Ahora: la primera vez que se pide una key se guarda en esta caché; si se
+// vuelve a pedir antes de que venza (SHARED_TTL_MS), se muestra al instante
+// sin esperar la red. Si ya venció, igual se muestra lo último conocido de
+// inmediato (para que la pantalla no quede "cargando...") mientras se pide
+// la versión fresca en segundo plano ("stale-while-revalidate"). Además, si
+// dos componentes piden la misma key al mismo tiempo, comparten la misma
+// petición en vez de duplicarla.
+const SHARED_LIST_CACHE = new Map();   // key -> { value, ts }
+const SHARED_LIST_INFLIGHT = new Map(); // key -> Promise en curso
+const SHARED_TTL_MS = 20000; // 20 segundos
+
+function fetchSharedListKey(key) {
+  if (SHARED_LIST_INFLIGHT.has(key)) return SHARED_LIST_INFLIGHT.get(key);
+  const p = (async () => {
+    try {
+      const res = await window.storage.get(key, true);
+      const val = res ? JSON.parse(res.value) : [];
+      SHARED_LIST_CACHE.set(key, { value: val, ts: Date.now() });
+      return val;
+    } catch {
+      const prev = SHARED_LIST_CACHE.get(key);
+      return prev ? prev.value : [];
+    } finally {
+      SHARED_LIST_INFLIGHT.delete(key);
+    }
+  })();
+  SHARED_LIST_INFLIGHT.set(key, p);
+  return p;
+}
+
 function useSharedList(key) {
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const cachedEntry = SHARED_LIST_CACHE.get(key);
+  const [items, setItems] = useState(cachedEntry ? cachedEntry.value : []);
+  const [loading, setLoading] = useState(!cachedEntry);
   const [error, setError] = useState(null);
 
   useEffect(() => {
     let active = true;
-    (async () => {
-      try {
-        const res = await window.storage.get(key, true);
-        if (active) setItems(res ? JSON.parse(res.value) : []);
-      } catch {
-        if (active) setItems([]);
-      }
-      if (active) setLoading(false);
-    })();
+    const entry = SHARED_LIST_CACHE.get(key);
+    const isFresh = entry && (Date.now() - entry.ts) < SHARED_TTL_MS;
+
+    if (entry) {
+      // Muestra al instante lo último conocido (sin esperar la red).
+      setItems(entry.value);
+      setLoading(false);
+    }
+
+    if (!isFresh) {
+      // No había caché, o venció: pide la versión fresca (en segundo plano
+      // si ya había algo que mostrar; de entrada si no había nada).
+      fetchSharedListKey(key).then((val) => {
+        if (active) { setItems(val); setLoading(false); }
+      }).catch(() => {
+        if (active) setLoading(false);
+      });
+    }
+
     return () => { active = false; };
   }, [key]);
 
@@ -225,6 +270,10 @@ function useSharedList(key) {
   // aunque la sincronización falle (y el usuario pueda reintentar sin perder lo escrito).
   const save = async (newItems) => {
     setItems(newItems);
+    // Actualiza también la caché compartida para que cualquier otra pantalla
+    // que pida esta misma key (aunque sea otro componente) vea el cambio
+    // de inmediato, sin tener que esperar a que venza el TTL.
+    SHARED_LIST_CACHE.set(key, { value: newItems, ts: Date.now() });
 
     // Sincroniza con Google Sheets (último item = el que se acaba de agregar/editar)
     if (newItems.length > 0) {
@@ -249,26 +298,58 @@ function useSharedList(key) {
   return [items, save, loading, error];
 }
 
+// Misma idea de caché que useSharedList, pero para valores individuales
+// (no listas) — por ejemplo el nombre del autor o la última área elegida.
+const PERSONAL_VALUE_CACHE = new Map();   // key -> { value, ts }
+const PERSONAL_VALUE_INFLIGHT = new Map(); // key -> Promise en curso
+
+function fetchPersonalValueKey(key) {
+  if (PERSONAL_VALUE_INFLIGHT.has(key)) return PERSONAL_VALUE_INFLIGHT.get(key);
+  const p = (async () => {
+    try {
+      const res = await window.storage.get(key, false);
+      if (res) PERSONAL_VALUE_CACHE.set(key, { value: res.value, ts: Date.now() });
+      return res ? res.value : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      PERSONAL_VALUE_INFLIGHT.delete(key);
+    }
+  })();
+  PERSONAL_VALUE_INFLIGHT.set(key, p);
+  return p;
+}
+
 function usePersonalValue(key, fallback) {
-  const [value, setValue] = useState(fallback);
-  const [loaded, setLoaded] = useState(false);
+  const cachedEntry = PERSONAL_VALUE_CACHE.get(key);
+  const [value, setValue] = useState(cachedEntry ? cachedEntry.value : fallback);
+  const [loaded, setLoaded] = useState(!!cachedEntry);
 
   useEffect(() => {
     let active = true;
-    (async () => {
-      try {
-        const res = await window.storage.get(key, false);
-        if (active && res) setValue(res.value);
-      } catch {
-        // sin valor guardado todavía
-      }
-      if (active) setLoaded(true);
-    })();
+    const entry = PERSONAL_VALUE_CACHE.get(key);
+    const isFresh = entry && (Date.now() - entry.ts) < SHARED_TTL_MS;
+
+    if (entry) {
+      setValue(entry.value);
+      setLoaded(true);
+    }
+
+    if (!isFresh) {
+      fetchPersonalValueKey(key).then((val) => {
+        if (active && val !== undefined) setValue(val);
+        if (active) setLoaded(true);
+      }).catch(() => {
+        if (active) setLoaded(true);
+      });
+    }
+
     return () => { active = false; };
   }, [key]);
 
   const update = async (v) => {
     setValue(v);
+    PERSONAL_VALUE_CACHE.set(key, { value: v, ts: Date.now() });
     try { await window.storage.set(key, v, false); } catch { /* noop */ }
   };
 
