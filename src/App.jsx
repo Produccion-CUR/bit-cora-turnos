@@ -4497,6 +4497,17 @@ function ProgramaProduccionScreen({ onBack }) {
   // WhatsApp) sigue considerando los 21 turnos completos.
   const slotsVista = slots.filter((s) => turnosVista[s.turno]);
 
+  // El cuadro también se ajusta solo según las líneas realmente programadas:
+  // se muestran únicamente las líneas que tienen al menos una entrada dentro
+  // de los turnos visibles (evita filas vacías de líneas que no se están
+  // trabajando esta semana). Si ninguna línea tiene entradas todavía, se
+  // muestran todas para no dejar el cuadro vacío mientras se recién empieza
+  // a cargar el programa.
+  const lineasConEntradas = programaLineas.filter((linea) =>
+    slotsVista.some((s) => (entriesPorSlot[slotKey(s)] || []).some((e) => e.lineaKey === linea.key))
+  );
+  const lineasVista = lineasConEntradas.length > 0 ? lineasConEntradas : programaLineas;
+
   // La observación se guarda para la fecha/turno que están seleccionados en
   // el formulario de "Agregar entrada al programa" — no es un formulario
   // aparte, así queda siempre asociada al mismo turno que se está cargando.
@@ -4634,7 +4645,7 @@ function ProgramaProduccionScreen({ onBack }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {programaLineas.map((linea) => {
+                    {lineasVista.map((linea) => {
                       const filaEntries = slotsVista.map((s) => (entriesPorSlot[slotKey(s)] || []).filter((e) => e.lineaKey === linea.key));
                       const metas = filaEntries.map((es) => es.filter((e) => e.especie !== "LAVADO").reduce((sum, e) => sum + num(e.cantidad), 0));
                       const cc = PROGRAMA_COLOR_CLASSES[linea.color] || PROGRAMA_COLOR_CLASSES.slate;
@@ -4672,7 +4683,7 @@ function ProgramaProduccionScreen({ onBack }) {
                   </tbody>
                 </table>
               </div>
-              <p className="text-xs text-slate-500 mt-2">Mostrando {slotsVista.length} de 21 turnos de la semana (Lunes a Domingo, T3/T1/T2) — ajusta arriba en "¿Con cuántos turnos se está trabajando?". Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
+              <p className="text-xs text-slate-500 mt-2">Mostrando {slotsVista.length} de 21 turnos de la semana (Lunes a Domingo, T3/T1/T2) — ajusta arriba en "¿Con cuántos turnos se está trabajando?" — y {lineasVista.length} de {programaLineas.length} líneas (solo las que tienen entradas programadas en los turnos visibles). Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
             </Card>
 
             {/* Observaciones por turno — tabla separada del schedule, no ocupa celdas de la grilla */}
