@@ -1022,8 +1022,13 @@ const VERIFICADOR_HORA = [
 // PROGRAMA_LINEAS y por las búsquedas existentes de nombre de producto.
 const ENVASADORA_SKUS = SKU_MATERIALES.map((s) => [s.sku, s.producto]);
 
+// Registro de SKU nuevos (agregados por el Jefe en la pestaña "SKU Envasado"
+// del Google Sheet). Se llena una vez al cargar la app — ver App() más abajo.
+// skuMaterial() revisa primero el maestro hardcodeado y después este registro.
+let SKU_NUEVOS = [];
+
 function skuMaterial(sku) {
-  return SKU_MATERIALES.find((s) => s.sku === sku) || null;
+  return SKU_MATERIALES.find((s) => s.sku === sku) || SKU_NUEVOS.find((s) => s.sku === sku) || null;
 }
 // Nota: los overrides del Jefe se aplican dentro de los componentes via useSkuOverrides().getMat(sku).
 // La función skuMaterial() sigue apuntando al maestro original para cálculos de Insumos y SKU picker.
@@ -1078,7 +1083,7 @@ function SkuPicker({ value, onChange, sugeridos, label = "Código SKU" }) {
   const resultados = useMemo(() => {
     const q = texto.trim().toLowerCase();
     if (!q) return [];
-    return SKU_MATERIALES
+    return [...SKU_MATERIALES, ...SKU_NUEVOS]
       .filter((s) => s.sku.toLowerCase().includes(q) || s.producto.toLowerCase().includes(q))
       .slice(0, 8);
   }, [texto]);
@@ -1095,7 +1100,7 @@ function SkuPicker({ value, onChange, sugeridos, label = "Código SKU" }) {
     setTimeout(() => {
       setAbierto(false);
       // Si lo que quedó escrito no coincide con ningún SKU válido, limpia.
-      const exact = SKU_MATERIALES.find((s) => s.sku.toLowerCase() === texto.trim().toLowerCase());
+      const exact = [...SKU_MATERIALES, ...SKU_NUEVOS].find((s) => s.sku.toLowerCase() === texto.trim().toLowerCase());
       if (exact) { onChange(exact.sku); setTexto(`${exact.sku} — ${exact.producto}`); return; }
       if (!value) onChange("");
     }, 150);
@@ -1739,7 +1744,7 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
           } else if (lk === "linea5") {
             kgLinea5 += cant;
           } else if (lk === "envasadora") {
-            const mat = SKU_MATERIALES.find((s) => s.sku === p.especie);
+            const mat = skuMaterial(p.especie);
             const cajasXPallet = mat ? num(mat.cajasXPallet) : 0;
             if (cajasXPallet > 0) palletsEnvasadora += cant / cajasXPallet;
             cajasPorSku[p.especie] = (cajasPorSku[p.especie] || 0) + cant;
@@ -1762,7 +1767,7 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
 
   const skuNecesidades = useMemo(() =>
     Object.entries(desglose.cajasPorSku).map(([sku, cajas]) => {
-      const mat = SKU_MATERIALES.find((s) => s.sku === sku);
+      const mat = skuMaterial(sku);
       const bxc = mat ? num(mat.bolsasXCaja) : 0;
       return {
         sku,
@@ -2376,9 +2381,9 @@ function useSkuOverrides() {
     return m;
   }, [overrides]);
 
-  // Devuelve el material fusionado (base del maestro + overrides del Jefe)
+  // Devuelve el material fusionado (base del maestro o SKU nuevo + overrides del Jefe)
   const getMat = (sku) => {
-    const base = SKU_MATERIALES.find((s) => s.sku === sku);
+    const base = SKU_MATERIALES.find((s) => s.sku === sku) || SKU_NUEVOS.find((s) => s.sku === sku);
     if (!base) return null;
     const over = overrideMap[sku] || {};
     return { ...base, ...over };
@@ -6202,6 +6207,13 @@ export default function App() {
   const [jefeFlag, setJefeFlag] = usePersonalValue("modo-jefe", "");
   const [showLogin, setShowLogin] = useState(false);
   const isJefe = jefeFlag === "true";
+
+  // SKU nuevos agregados por el Jefe en la pestaña "SKU Envasado" del Google
+  // Sheet (si hay conexión configurada). Se actualiza el registro a nivel de
+  // módulo ANTES de que rendericen los hijos, para que skuMaterial()/SkuPicker
+  // ya los vean disponibles en este mismo render.
+  const [skuNuevos] = useSharedList("sku-nuevos");
+  SKU_NUEVOS = skuNuevos || [];
 
   // A qué pantalla volver según dónde estamos
   const backTarget = (s) => {
