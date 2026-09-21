@@ -575,9 +575,12 @@ function stockInsumosSeleccion(stockCrudo) {
   s["Caja de Fixo Azul"]           = s["Fixo Azul"]              ?? null;
   s["Caja de Fixo Café"]           = s["Fixo Café"]              ?? null;
   s["Caja de Fixo Transparente"]   = s["Fixo Transparente"]      ?? null;
-  s["Paquete Bolsas Bins Transparentes"] = s["Bolsas Bins"] != null ? s["Bolsas Bins"] / 30 : null;
-  s["Pallet de bolsas 899"]        = s["Bolsas 899"] != null ? s["Bolsas 899"] / 12000 : null;
-  s["Pallet de bolsas 1744"]       = s["Bolsas 1744 (Totes)"] != null ? s["Bolsas 1744 (Totes)"] / 12000 : null;
+  // Bolsas 899 / 1744 y Bolsas Bins se ingresan directamente en su unidad final
+  // (Pallets y Paquetes respectivamente) en el formulario de Materiales piso
+  // planta, así que aquí solo se traspasan tal cual — sin dividir.
+  s["Paquete Bolsas Bins Transparentes"] = s["Bolsas Bins"] ?? null;
+  s["Pallet de bolsas 899"]        = s["Bolsas 899"] ?? null;
+  s["Pallet de bolsas 1744"]       = s["Bolsas 1744 (Totes)"] ?? null;
   s["Pallet de cajas (MTC)"]       = ((s["Pallet MTC1280"] || 0) + (s["Pallet MTC1310"] || 0)) || null;
   return s;
 }
@@ -615,11 +618,27 @@ const MATERIALES_SELECCION = [
   "Pallet Tote Armados", "Pallet Cajas Armados 1310", "Pallet Cajas Armados 1280", "Pallet Totes x Armar",
 ];
 
-const MATERIALES_ENVASADO = ["Pallet Certificado", "Film Máquina", "Film Manual", "MTC Cajas", "MTC Bolsas"];
+const MATERIALES_ENVASADO = ["Pallet Certificado", "Film Máquina", "Film Manual", "Cantidad MTC Cajas", "Cantidad MTC Bolsas"];
 // Insumos de Lavado que se rastrean como stock (igual patrón que Selección/
 // Envasado vía MaterialesTable + finMat_i), para que Insumos y Consumo y las
 // alertas de vencimiento puedan comparar Necesito vs. Tengo también aquí.
 const MATERIALES_LAVADO = ["Caja de Film Manual", "Paquete Bolsas Bins Transparentes"];
+
+// Aclaración de unidad de medida que se muestra junto a cada campo en el
+// formulario de Materiales piso planta (Selección, Envasado y Lavado). Es
+// solo informativo — no cambia la llave con la que se guarda cada material,
+// para no romper la compatibilidad con registros ya guardados.
+const MATERIAL_UNIDAD = {
+  "Bolsas 899": "cantidad de Pallets",
+  "Bolsas 1744 (Totes)": "cantidad de Pallets",
+  "Bolsas Bins": "Paquete",
+  "Fixo Azul": "Cajas",
+  "Fixo Transparente": "Cajas",
+  "Fixo Café": "Cajas",
+  "Film Máquina": "Cajas",
+  "Film Manual": "Cajas",
+  "Caja de Film Manual": "Cajas",
+};
 
 // Dotación
 const DOTACION_GENERAL_SELECCION = [
@@ -3395,7 +3414,13 @@ function MaterialesTable({ items, values, setField, prefix }) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
       {items.map((label, i) => (
-        <NumField key={i} label={label} value={values[`${prefix}_${i}`]} onChange={(v) => setField(`${prefix}_${i}`, v)} />
+        <NumField
+          key={i}
+          label={label}
+          unit={MATERIAL_UNIDAD[label]}
+          value={values[`${prefix}_${i}`]}
+          onChange={(v) => setField(`${prefix}_${i}`, v)}
+        />
       ))}
     </div>
   );
