@@ -3,6 +3,7 @@ import {
   Droplets, Filter, Package, ClipboardCheck, ClipboardList, BarChart3, Settings, X, Lock,
   Save, ArrowLeft, User, Loader2, CheckCircle2, AlertTriangle, Sun, Moon, Clock, Pencil,
   Trash2, LogOut, CalendarDays, Share2, Boxes, Plus, ChevronRight, BookOpen, ChevronDown,
+  Truck,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
@@ -504,17 +505,60 @@ function useCarryOver(areaKey, values, setField, editingId, mapping) {
   const prevCierre = prevClave ? cierres.find((c) => c.claveTurno === prevClave) : null;
 
   useEffect(() => {
-    if (editingId || !prevCierre) return;
+    if (editingId) return;
     const allEmpty = mapping.every(([, target]) => values[target] === undefined || values[target] === "" || values[target] === null);
     if (!allEmpty) return;
-    mapping.forEach(([source, target]) => {
-      const v = prevCierre[source];
-      if (v !== undefined && v !== "") setField(target, v);
-    });
+    if (prevCierre) {
+      // Hay cierre del turno anterior: los materiales de piso planta del
+      // Inicio parten iguales a los del fin de ese cierre.
+      mapping.forEach(([source, target]) => {
+        const v = prevCierre[source];
+        if (v !== undefined && v !== "") setField(target, v);
+      });
+    } else if (values.fecha && values.turno) {
+      // No hubo cierre anterior registrado: los materiales de piso planta
+      // parten en 0 (explícito, no en blanco, para no confundir "sin dato"
+      // con "en cero" al mirar el registro después).
+      mapping.forEach(([, target]) => setField(target, "0"));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [values.fecha, values.turno, prevCierre?.id, editingId]);
 
   return { prevCierre, prev };
+}
+
+// Devuelve el stock de materiales de piso de planta MÁS RECIENTE conocido,
+// comparando el último "Inicio de turno" registrado con el último "Cierre de
+// turno" registrado — usa el que sea más nuevo cronológicamente (claveTurno
+// es "fecha|turno", que se puede comparar directamente como texto: mismo
+// orden que el tiempo real). Esto hace falta porque antes Insumos y Consumo
+// solo miraba el último CIERRE: si alguien acababa de completar un Inicio de
+// turno con los materiales de piso planta pero ese turno todavía no se
+// cerraba, Insumos seguía mostrando el stock de un cierre anterior (más
+// viejo), sin considerar lo recién ingresado.
+function ultimoStockMateriales(inicioRecords, cierreRecords, materiales) {
+  const masReciente = (lista) =>
+    [...lista].sort((a, b) => String(b.claveTurno || "").localeCompare(String(a.claveTurno || "")))[0] || null;
+  const ultimoInicio = masReciente(inicioRecords);
+  const ultimoCierre = masReciente(cierreRecords);
+
+  let fuente = null, prefijo = "finMat";
+  if (ultimoInicio && ultimoCierre) {
+    if (String(ultimoInicio.claveTurno) > String(ultimoCierre.claveTurno)) {
+      fuente = ultimoInicio; prefijo = "inicioMat";
+    } else {
+      fuente = ultimoCierre; prefijo = "finMat";
+    }
+  } else if (ultimoInicio) {
+    fuente = ultimoInicio; prefijo = "inicioMat";
+  } else if (ultimoCierre) {
+    fuente = ultimoCierre; prefijo = "finMat";
+  }
+
+  if (!fuente) return {};
+  const s = {};
+  materiales.forEach((m, i) => { s[m] = num(fuente[`${prefijo}_${i}`]); });
+  return s;
 }
 
 
@@ -1443,8 +1487,11 @@ function calcFormatos(totalKg, item) {
 // ---------------------------------------------------------------------------
 function useAlertasInsumos() {
   const [programas]        = useSharedList("programa-records");
+  const [seleccionInicios] = useSharedList("seleccion-inicio-records");
   const [seleccionCierres] = useSharedList("seleccion-cierre-records");
+  const [envasadoInicios]  = useSharedList("envasado-inicio-records");
   const [envasadoCierres]  = useSharedList("envasado-cierre-records");
+  const [lavadoInicios]    = useSharedList("lavado-inicio-records");
   const [lavadoCierres]    = useSharedList("lavado-cierre-records");
   const { config: insumosConfig } = useInsumosConfig();
 
@@ -1466,19 +1513,12 @@ function useAlertasInsumos() {
     const nTurnosEnv = turnosEnv.size;
     const pallets = kgSeleccion / KG_POR_PALLET_SELECCION;
 
-    const stockDe = (cierres) => {
-      const last = [...cierres].sort((a, b) => b.id - a.id)[0];
-      return last || {};
-    };
-    const stockPorNombre = (cierre, materiales) => {
-      const s = {};
-      materiales.forEach((m, i) => { s[m] = num(cierre[`finMat_${i}`]); });
-      return s;
-    };
-    const stockSel    = stockPorNombre(stockDe(seleccionCierres), MATERIALES_SELECCION);
-    const stockEnv     = stockPorNombre(stockDe(envasadoCierres), MATERIALES_ENVASADO);
-    const stockLavado  = stockPorNombre(stockDe(lavadoCierres), MATERIALES_LAVADO);
-    const ultimoLavado = stockDe(lavadoCierres);
+    const stockSel    = ultimoStockMateriales(seleccionInicios, seleccionCierres, MATERIALES_SELECCION);
+    const stockEnv     = ultimoStockMateriales(envasadoInicios, envasadoCierres, MATERIALES_ENVASADO);
+    const stockLavado  = ultimoStockMateriales(lavadoInicios, lavadoCierres, MATERIALES_LAVADO);
+    // Pallets pendientes de lavar (backlog) solo se registra al Cierre, no
+    // tiene equivalente en Inicio — se sigue tomando del último cierre.
+    const ultimoLavado = [...lavadoCierres].sort((a, b) => b.id - a.id)[0] || {};
     const palletsBandejasLavado = totalPalletsManual(ultimoLavado, "pendientes");
 
     const alertas = [];
@@ -1533,7 +1573,7 @@ function useAlertasInsumos() {
     }
 
     return alertas;
-  }, [programas, seleccionCierres, envasadoCierres, lavadoCierres, insumosConfig]);
+  }, [programas, seleccionInicios, seleccionCierres, envasadoInicios, envasadoCierres, lavadoInicios, lavadoCierres, insumosConfig]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,8 +1735,11 @@ function SeccionFijos({ areaKey, stockMap, titulo, insumosFijo, nTurnos }) {
 
 function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
   const [programas]        = useSharedList("programa-records");
+  const [lavadoInicios]    = useSharedList("lavado-inicio-records");
   const [lavadoCierres]    = useSharedList("lavado-cierre-records");
+  const [seleccionInicios] = useSharedList("seleccion-inicio-records");
   const [seleccionCierres] = useSharedList("seleccion-cierre-records");
+  const [envasadoInicios]  = useSharedList("envasado-inicio-records");
   const [envasadoCierres]  = useSharedList("envasado-cierre-records");
   const { config: insumosConfig } = useInsumosConfig();
   const INSUMOS_VARIABLE = insumosConfig.variable;
@@ -1740,12 +1783,12 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
     return [...fset].sort();
   }, [programas, areaFiltro]);
 
-  // ── Stock actual (último cierre de cada área) ─────────────────────────────
+  // ── Stock actual (Inicio o Cierre más reciente de cada área — lo que sea
+  // más nuevo, así se refleja un Inicio de turno recién completado aunque
+  // ese turno todavía no se haya cerrado) ──────────────────────────────────
   const stockSeleccion = useMemo(() => {
-    const last = [...seleccionCierres].sort((a, b) => b.id - a.id)[0];
-    if (!last) return {};
-    const s = {};
-    MATERIALES_SELECCION.forEach((m, i) => { s[m] = num(last[`finMat_${i}`]); });
+    const s = ultimoStockMateriales(seleccionInicios, seleccionCierres, MATERIALES_SELECCION);
+    if (Object.keys(s).length === 0) return s;
     // Conversiones a las unidades de solicitud (para que RowInsumo/RowFijo
     // pueda cruzar "Tengo" contra lo que hay en stock real del piso de planta).
     s["Caja de Film Máquina"]        = s["Film Máquina"]           ?? null;
@@ -1758,37 +1801,33 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
     s["Pallet de bolsas 1744"]       = s["Bolsas 1744 (Totes)"] != null ? s["Bolsas 1744 (Totes)"] / 12000 : null;
     s["Pallet de cajas (MTC)"]       = ((s["Pallet MTC1280"] || 0) + (s["Pallet MTC1310"] || 0)) || null;
     return s;
-  }, [seleccionCierres]);
+  }, [seleccionInicios, seleccionCierres]);
 
   const stockEnvasado = useMemo(() => {
-    const last = [...envasadoCierres].sort((a, b) => b.id - a.id)[0];
-    if (!last) return {};
-    const s = {};
-    MATERIALES_ENVASADO.forEach((m, i) => { s[m] = num(last[`finMat_${i}`]); });
+    const s = ultimoStockMateriales(envasadoInicios, envasadoCierres, MATERIALES_ENVASADO);
+    if (Object.keys(s).length === 0) return s;
     s["Caja de Film Máquina"] = s["Film Máquina"] ?? null;
     s["Caja de Film Manual"]  = s["Film Manual"]  ?? null;
     s["Caja de Fixo Azul"]    = s["Fixo Azul"]    ?? null;
     return s;
-  }, [envasadoCierres]);
+  }, [envasadoInicios, envasadoCierres]);
 
   // Pallets de bandejas pendientes según el último cierre de Lavado registrado
   // (Lavado no se programa con cantidad en el Programa de producción, así que
   // se usa el backlog real reportado al cierre como referencia de "Necesito").
+  // Este dato solo se registra al Cierre (no tiene equivalente en Inicio).
   const palletsBandejasLavado = useMemo(() => {
     const last = [...lavadoCierres].sort((a, b) => b.id - a.id)[0];
     if (!last) return 0;
     return totalPalletsManual(last, "pendientes");
   }, [lavadoCierres]);
 
-  // Stock actual de Lavado (Film Manual, Bolsas Bins Transparentes) desde el
-  // último cierre — mismo patrón finMat_i que Selección/Envasado.
-  const stockLavado = useMemo(() => {
-    const last = [...lavadoCierres].sort((a, b) => b.id - a.id)[0];
-    if (!last) return {};
-    const s = {};
-    MATERIALES_LAVADO.forEach((m, i) => { s[m] = num(last[`finMat_${i}`]); });
-    return s;
-  }, [lavadoCierres]);
+  // Stock actual de Lavado (Film Manual, Bolsas Bins Transparentes) — Inicio
+  // o Cierre más reciente, mismo patrón que Selección/Envasado.
+  const stockLavado = useMemo(
+    () => ultimoStockMateriales(lavadoInicios, lavadoCierres, MATERIALES_LAVADO),
+    [lavadoInicios, lavadoCierres]
+  );
 
   // ── Desglose de Selección y Envasado para la fecha/turnos seleccionados ───
   // Selección: separa Kg de Frambuesa en Línea 4 (usa Tote/Bolsa 1744) del
@@ -3258,7 +3297,9 @@ function BandejaTable({ values, setField, prefix, soloPallets }) {
 }
 
 function LavadoInicio({ values, setField, editingId }) {
-  const mapping = TIPOS_BANDEJA.map((t) => [`pendientes_${t.key}_pallets`, `sucios_${t.key}_pallets`]);
+  const mappingBandejas = TIPOS_BANDEJA.map((t) => [`pendientes_${t.key}_pallets`, `sucios_${t.key}_pallets`]);
+  const mappingMateriales = MATERIALES_LAVADO.map((_, i) => [`finMat_${i}`, `inicioMat_${i}`]);
+  const mapping = [...mappingBandejas, ...mappingMateriales];
   const { prevCierre, prev } = useCarryOver("lavado", values, setField, editingId, mapping);
 
   return (
@@ -3291,6 +3332,19 @@ function LavadoInicio({ values, setField, editingId }) {
           </p>
         )}
         <BandejaTable values={values} setField={setField} prefix="sucios" soloPallets />
+      </Card>
+
+      <Card title="Materiales piso planta" step={4}>
+        {prevCierre ? (
+          <p className="text-xs text-emerald-700 mb-3">
+            Se completó automáticamente con los materiales de piso de planta del cierre {turnoLabel(prev.turno)} del {fmtFecha(prev.fecha)}. Puedes ajustarlos si es necesario.
+          </p>
+        ) : (
+          <p className="text-xs text-slate-400 mb-3">
+            Sin cierre de turno anterior registrado — se completó en 0. Ajusta si corresponde.
+          </p>
+        )}
+        <MaterialesTable items={MATERIALES_LAVADO} values={values} setField={setField} prefix="inicioMat" />
       </Card>
     </div>
   );
@@ -3528,9 +3582,13 @@ function SeleccionInicio({ values, setField, programaEntries, editingId }) {
       <ProgramaResumen entries={programaEntries.filter((e) => ["linea1", "linea3", "linea4", "linea5", "linea6"].includes(e.lineaKey))} fecha={values.fecha} horarios={horarios} />
 
       <Card title="Materiales piso planta" step={2}>
-        {prevCierre && (
+        {prevCierre ? (
           <p className="text-xs text-emerald-700 mb-3">
             Se completó automáticamente con los materiales de piso de planta del cierre {turnoLabel(prev.turno)} del {fmtFecha(prev.fecha)}. Puedes ajustarlos si es necesario.
+          </p>
+        ) : (
+          <p className="text-xs text-slate-400 mb-3">
+            Sin cierre de turno anterior registrado — se completó en 0. Ajusta si corresponde.
           </p>
         )}
         <MaterialesTable items={MATERIALES_SELECCION} values={values} setField={setField} prefix="inicioMat" />
@@ -3913,9 +3971,13 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
       <ProgramaResumen entries={programaEntries.filter((e) => ["linea5", "envasadora"].includes(e.lineaKey))} fecha={values.fecha} horarios={horarios} />
 
       <Card title="Materiales piso planta" step={2}>
-        {prevCierre && (
+        {prevCierre ? (
           <p className="text-xs text-emerald-700 mb-3">
             Se completó automáticamente con los materiales de piso de planta del cierre {turnoLabel(prev.turno)} del {fmtFecha(prev.fecha)}. Puedes ajustarlos si es necesario.
+          </p>
+        ) : (
+          <p className="text-xs text-slate-400 mb-3">
+            Sin cierre de turno anterior registrado — se completó en 0. Ajusta si corresponde.
           </p>
         )}
         <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="inicioMat" />
@@ -5084,6 +5146,35 @@ function EntregaMaterialesCard({ areaKey, fecha, turno, autor, supervisoresList 
   );
 }
 
+// ---------------------------------------------------------------------------
+// Pestaña: Entrega de Materiales (Selección y Envasado) — separada del
+// Cierre de turno. La persona elige la fecha y el turno que entrega, igual
+// que en Cierre de turno, y aparece la misma tarjeta de siempre.
+// ---------------------------------------------------------------------------
+function EntregaMaterialesTab({ area, autor, supervisoresList }) {
+  const [fecha, setFecha] = useState(today());
+  const [turno, setTurno] = useState("");
+
+  return (
+    <div className="space-y-4 pb-10">
+      <Card title="Selecciona el turno que entrega" step={1}>
+        <div className="mb-3">
+          <label className="block text-xs font-medium text-slate-600 mb-1">Fecha</label>
+          <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fecha} onChange={(e) => setFecha(e.target.value)} />
+        </div>
+        <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
+        <TurnoSelector value={turno} onChange={setTurno} />
+      </Card>
+
+      {!turno ? (
+        <Card><EmptyNote text="Selecciona la fecha y el turno que entrega para registrar la entrega de materiales." /></Card>
+      ) : (
+        <EntregaMaterialesCard areaKey={area.key} fecha={fecha} turno={turno} autor={autor} supervisoresList={supervisoresList} />
+      )}
+    </div>
+  );
+}
+
 function VerificadorHoraScreen({ onBack }) {
   const [horaConsulta, setHoraConsulta] = useState(horaActualStr());
   const codigoActual = codigoVerificadorPara(horaConsulta);
@@ -5607,8 +5698,6 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
 
           <CierreComponent values={values} setField={setField} inicio={inicio} programaEntries={programaEntries} />
 
-          <EntregaMaterialesCard areaKey={area.key} fecha={fecha} turno={turno} autor={autor} supervisoresList={supervisoresList} />
-
           <Card title="Finalizar cierre">
             {cierreActual?.estado === "Enviado" && (
               <p className="text-sm text-slate-600 mb-3">
@@ -5827,6 +5916,11 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
   const tabs = [
     { key: "inicio", label: "Inicio de turno", icon: ClipboardList },
     { key: "cierre", label: "Cierre de turno", icon: ClipboardCheck },
+    // Entrega de Materiales solo aplica a Selección y Envasado (Lavado no maneja
+    // esta entrega entre turnos) — pestaña propia, separada del Cierre de turno.
+    ...(area.key === "seleccion" || area.key === "envasado"
+      ? [{ key: "entrega", label: "Entrega Materiales", icon: Truck }]
+      : []),
     { key: "indicadores", label: "Indicadores", icon: BarChart3 },
     { key: "registros", label: "Registros", icon: Pencil },
   ];
@@ -5856,6 +5950,7 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
           <InicioTab area={area} values={values} setField={setField} editingId={editingId} onSaved={handleSaved} onCancelEdit={cancelEdit} autor={autor} />
         )}
         {tab === "cierre" && <CierreTab area={area} autor={autor} initialTarget={cierreTarget} supervisoresList={supervisoresList} />}
+        {tab === "entrega" && <EntregaMaterialesTab area={area} autor={autor} supervisoresList={supervisoresList} />}
         {tab === "indicadores" && <IndicadoresTab area={area} />}
         {tab === "registros" && <RegistrosTab area={area} onEdit={startEdit} onEditCierre={startEditCierre} />}
       </div>
