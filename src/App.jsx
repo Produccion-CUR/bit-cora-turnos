@@ -1,14 +1,13 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import {
   Droplets, Filter, Package, ClipboardCheck, ClipboardList, BarChart3, Settings, X, Lock,
   Save, ArrowLeft, User, Loader2, CheckCircle2, AlertTriangle, Sun, Moon, Clock, Pencil,
   Trash2, LogOut, CalendarDays, Share2, Boxes, Plus, ChevronRight, BookOpen, ChevronDown,
-  Truck, Camera,
+  Truck,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
 } from "recharts";
-import html2canvas from "html2canvas";
 
 // ---------------------------------------------------------------------------
 // Constantes generales
@@ -4439,8 +4438,6 @@ function ProgramaProduccionScreen({ onBack }) {
   // columnas se muestran en "Vista general de la semana" (no borra ni oculta
   // las entradas ya guardadas de un turno que se desmarque acá).
   const [turnosVista, setTurnosVista] = useState({ T1: true, T2: true, T3: true });
-  const capturaRef = useRef(null);
-  const [compartiendoImagen, setCompartiendoImagen] = useState(false);
 
   useEffect(() => {
     setDraft((prev) => ({ ...prev, fecha: fechaInicio }));
@@ -4474,43 +4471,6 @@ function ProgramaProduccionScreen({ onBack }) {
   // como activos arriba. El resto de la pantalla (entradas, observaciones,
   // WhatsApp) sigue considerando los 21 turnos completos.
   const slotsVista = slots.filter((s) => turnosVista[s.turno]);
-
-  const handleCompartirImagen = async () => {
-    if (!capturaRef.current) return;
-    setCompartiendoImagen(true);
-    try {
-      const canvas = await html2canvas(capturaRef.current, { scale: 2, backgroundColor: "#ffffff" });
-      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-      if (!blob) throw new Error("No se pudo generar la imagen.");
-      const file = new File([blob], `programa-semana-${fechaInicio}.png`, { type: "image/png" });
-      const texto = `Programa de producción — semana del ${fmtFechaCorta(mondayOfWeek(fechaInicio))}`;
-
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        // Móvil (Android/iPhone): abre el panel nativo de compartir — ahí se
-        // elige WhatsApp y la imagen queda adjunta, igual que una captura de
-        // pantalla común.
-        await navigator.share({ files: [file], title: "Programa de producción", text: texto });
-      } else {
-        // Escritorio u otro navegador sin soporte para compartir archivos:
-        // se descarga la imagen para adjuntarla manualmente en WhatsApp.
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `programa-semana-${fechaInicio}.png`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-        setToast({ kind: "ok", message: "Imagen descargada — adjúntala manualmente en tu chat de WhatsApp." });
-      }
-    } catch (err) {
-      if (err?.name !== "AbortError") { // el usuario cerró el panel de compartir — no es un error real
-        setToast({ kind: "error", message: "No se pudo generar la imagen. Intenta nuevamente." });
-      }
-    } finally {
-      setCompartiendoImagen(false);
-    }
-  };
 
   // La observación se guarda para la fecha/turno que están seleccionados en
   // el formulario de "Agregar entrada al programa" — no es un formulario
@@ -4626,17 +4586,6 @@ function ProgramaProduccionScreen({ onBack }) {
           >
             <Share2 size={18} /> Enviar Programa de {fechaEnvioWA ? fmtFechaCorta(fechaEnvioWA) : "la fecha elegida"}
           </a>
-          <button
-            type="button"
-            onClick={handleCompartirImagen}
-            disabled={compartiendoImagen}
-            className="w-full mt-2 flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-white font-semibold rounded-xl py-3 transition-colors text-sm"
-          >
-            <Camera size={18} /> {compartiendoImagen ? "Generando imagen…" : "Compartir imagen (vista general + observaciones)"}
-          </button>
-          <p className="text-xs text-slate-400 mt-2">
-            En el celular abre el panel de compartir de WhatsApp con la imagen ya adjunta. En computador, la descarga para que la adjuntes tú.
-          </p>
           {toast && <div className="mt-2"><Toast {...toast} /></div>}
         </Card>
 
@@ -4644,10 +4593,9 @@ function ProgramaProduccionScreen({ onBack }) {
           <Card><Loader /></Card>
         ) : (
           <>
-            <div ref={capturaRef} className="space-y-4 bg-white">
             <Card title="Vista general de la semana">
               <div className="overflow-x-auto -mx-4 px-4">
-                <table className="border-collapse text-[11px] min-w-[2300px]">
+                <table className="border-collapse text-[11px]" style={{ minWidth: `${90 + slotsVista.length * 104}px` }}>
                   <thead>
                     <tr>
                       <th className="sticky left-0 z-10 bg-slate-100 border border-slate-300 px-2 py-1 text-left text-slate-600 min-w-[90px]">Línea</th>
@@ -4824,7 +4772,6 @@ function ProgramaProduccionScreen({ onBack }) {
                 </div>
               )}
             </Card>
-            </div>
 
             <Card title="Entradas de la semana" step={3}>
               {entriesVentana.length === 0 ? (
