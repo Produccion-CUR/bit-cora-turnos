@@ -500,9 +500,20 @@ function SupervisorSelect({ area, value, onChange, supervisoresList }) {
 // Solo completa campos vacíos y solo si no se está editando un registro existente.
 function useCarryOver(areaKey, values, setField, editingId, mapping) {
   const [cierres] = useSharedList(`${areaKey}-cierre-records`);
-  const prev = turnoAnterior(values.fecha, values.turno);
-  const prevClave = prev ? claveTurno(prev.fecha, prev.turno) : null;
-  const prevCierre = prevClave ? cierres.find((c) => c.claveTurno === prevClave) : null;
+
+  // Busca el cierre más reciente anterior a este turno. No basta con mirar
+  // solo el turno inmediatamente anterior (T3→T1→T2→T3 del día siguiente):
+  // si la planta no trabajó todos los turnos (p. ej. se saltó un T3), el
+  // cierre real más reciente puede estar más atrás. Se recorre turno por
+  // turno hacia atrás hasta encontrar un cierre guardado (o hasta un límite
+  // razonable, ~20 días, para no quedar en un loop si nunca hubo cierres).
+  let prev = turnoAnterior(values.fecha, values.turno);
+  let prevCierre = null;
+  for (let pasos = 0; prev && !prevCierre && pasos < 60; pasos++) {
+    const clave = claveTurno(prev.fecha, prev.turno);
+    prevCierre = cierres.find((c) => c.claveTurno === clave) || null;
+    if (!prevCierre) prev = turnoAnterior(prev.fecha, prev.turno);
+  }
 
   useEffect(() => {
     if (editingId) return;
