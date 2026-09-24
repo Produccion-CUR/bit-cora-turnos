@@ -682,9 +682,10 @@ const MATERIALES_SELECCION = [
   "Bolsas 1744 (Totes)", "Bolsas Bins", "Fixo Azul", "Fixo Transparente",
   "Fixo Café", "Film Máquina", "Film Manual", "Rollo Cotona",
   "Pallet Tote Armados", "Pallet Cajas Armados 1310", "Pallet Cajas Armados 1280", "Pallet Totes x Armar",
+  "Pallet Certificado",
 ];
 
-const MATERIALES_ENVASADO = ["Pallet Certificado", "Film Máquina", "Film Manual", "Cantidad MTC Cajas", "Cantidad MTC Bolsas"];
+const MATERIALES_ENVASADO = ["Pallet Certificado", "Film Máquina", "Film Manual", "Cantidad MTC Cajas", "Cantidad MTC Bolsas", "Pallet Taco Normal"];
 // Insumos de Lavado que se rastrean como stock (igual patrón que Selección/
 // Envasado vía MaterialesTable + finMat_i), para que Insumos y Consumo y las
 // alertas de vencimiento puedan comparar Necesito vs. Tengo también aquí.
@@ -1437,11 +1438,24 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries) {
     `${ind.label}: ${indTexto}`,
     "",
   ];
+  // Orden fijo del mensaje: 1) dotación global (no por línea), 2) datos de
+  // producción (kg, rendimiento, cumplimiento), 3) materiales de piso, y
+  // recién después los comentarios del cierre e incidentes/accidentes.
   if (area.resumenCompletoCierre) {
-    const detalle = area.resumenCompletoCierre(record, inicio, programaEntries);
-    if (detalle.length > 0) {
-      lineas.push("*Detalle del turno:*");
-      detalle.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoCierre(record, inicio, programaEntries) || {};
+    if (dotacion.length > 0) {
+      lineas.push("*Dotación:*");
+      dotacion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
+    if (produccion.length > 0) {
+      lineas.push("*Producción:*");
+      produccion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
+    if (materiales.length > 0) {
+      lineas.push("*Materiales de Piso:*");
+      materiales.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
       lineas.push("");
     }
   }
@@ -1477,11 +1491,28 @@ function buildResumenWhatsappInicio(area, record) {
     `Hora de inicio: ${record.horaInicio || "—"}`,
     "",
   ];
-  const detalle = area.resumenCompletoInicio ? area.resumenCompletoInicio(record) : area.resumenInicio(record);
-  detalle.forEach(([label, value]) => {
-    lineas.push(`• ${label}: ${value ?? "—"}`);
-  });
-  return lineas.join("\n");
+  // Mismo orden que el cierre: dotación global, producción, materiales de piso.
+  if (area.resumenCompletoInicio) {
+    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoInicio(record) || {};
+    if (dotacion.length > 0) {
+      lineas.push("*Dotación:*");
+      dotacion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
+    if (produccion.length > 0) {
+      lineas.push("*Producción:*");
+      produccion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
+    if (materiales.length > 0) {
+      lineas.push("*Materiales de Piso:*");
+      materiales.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
+  } else {
+    area.resumenInicio(record).forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+  }
+  return lineas.join("\n").replace(/\n+$/, "");
 }
 
 function whatsappShareUrl(text) {
@@ -1631,6 +1662,29 @@ function calcFormatos(totalKg, item) {
 // último cierre registrado. Es un aviso "a grandes rasgos": para el detalle
 // exacto de cuánto pedir según el turno, siempre está la pantalla de Insumos.
 // ---------------------------------------------------------------------------
+// Pedidos de insumos hechos DURANTE el turno (ej. se llamó a Bodega a pedir
+// más Fixo antes de que se registre un nuevo Cierre con el stock ya
+// actualizado). Se guardan aparte del stock real para que, apenas alguien
+// registra el pedido, el aviso de "falta material" de la pantalla de Inicio
+// se descuente al instante — sin esperar a que quede reflejado en un Cierre.
+function usePedidosInsumos() {
+  const [pedidos, save, loading, error] = useSharedList("pedidos-insumos");
+
+  const registrarPedido = async ({ area, nombre, cantidad, formato, autor }) => {
+    const record = {
+      id: Date.now(),
+      area, nombre, formato: formato || "",
+      cantidad: num(cantidad),
+      fecha: today(),
+      hora: horaActualStr(),
+      autor: autor || "",
+    };
+    return save([record, ...pedidos]);
+  };
+
+  return { pedidos, registrarPedido, loading, error };
+}
+
 function useAlertasInsumos() {
   const [programas]        = useSharedList("programa-records");
   const [seleccionInicios] = useSharedList("seleccion-inicio-records");
@@ -1640,11 +1694,22 @@ function useAlertasInsumos() {
   const [lavadoInicios]    = useSharedList("lavado-inicio-records");
   const [lavadoCierres]    = useSharedList("lavado-cierre-records");
   const { config: insumosConfig } = useInsumosConfig();
+  const { pedidos } = usePedidosInsumos();
 
   return useMemo(() => {
     const hoy = today();
     const manana = nextDateISO(hoy);
     const ventana = [hoy, manana];
+
+    // Cuánto se pidió durante el turno, por área + insumo, dentro de la
+    // ventana hoy/mañana — se resta directamente de lo que falta.
+    const pedidoPor = {};
+    pedidos.forEach((p) => {
+      if (!ventana.includes(p.fecha)) return;
+      const k = `${p.area}||${p.nombre}`;
+      pedidoPor[k] = (pedidoPor[k] || 0) + num(p.cantidad);
+    });
+    const pedidoDe = (area, nombre) => pedidoPor[`${area}||${nombre}`] || 0;
 
     let kgSeleccion = 0;
     const turnosSel = new Set(), turnosEnv = new Set();
@@ -1669,20 +1734,26 @@ function useAlertasInsumos() {
 
     const alertas = [];
 
+    // Empuja una alerta solo si, después de descontar lo ya pedido durante el
+    // turno, todavía falta algo.
+    const empujarAlerta = (area, item, necesito, tengo) => {
+      const pedido = pedidoDe(area, item.nombre);
+      const faltaNeta = necesito - tengo - pedido;
+      if (faltaNeta > 1e-9) {
+        alertas.push({ area, nombre: item.nombre, falta: faltaNeta, formato: item.formato, pedido });
+      }
+    };
+
     if (nTurnosSel > 0) {
       (insumosConfig.variable.seleccion || []).forEach((item) => {
         const necesito = calcFormatos(pallets, item);
         const tengo = stockSel[item.nombre];
-        if (tengo !== undefined && necesito > tengo) {
-          alertas.push({ area: "Selección", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
-        }
+        if (tengo !== undefined && necesito > tengo) empujarAlerta("Selección", item, necesito, tengo);
       });
       (insumosConfig.fijo.seleccion || []).forEach((item) => {
         const necesito = item.cantXTurno * nTurnosSel;
         const tengo = stockSel[item.nombre];
-        if (tengo !== undefined && necesito > tengo) {
-          alertas.push({ area: "Selección", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
-        }
+        if (tengo !== undefined && necesito > tengo) empujarAlerta("Selección", item, necesito, tengo);
       });
     }
 
@@ -1690,9 +1761,7 @@ function useAlertasInsumos() {
       (insumosConfig.fijo.envasado || []).forEach((item) => {
         const necesito = item.cantXTurno * nTurnosEnv;
         const tengo = stockEnv[item.nombre];
-        if (tengo !== undefined && necesito > tengo) {
-          alertas.push({ area: "Envasado", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
-        }
+        if (tengo !== undefined && necesito > tengo) empujarAlerta("Envasado", item, necesito, tengo);
       });
     }
 
@@ -1703,23 +1772,19 @@ function useAlertasInsumos() {
       (insumosConfig.variable.lavado || []).forEach((item) => {
         const necesito = calcFormatos(palletsBandejasLavado, item);
         const tengo = stockLavado[item.nombre];
-        if (tengo !== undefined && necesito > tengo) {
-          alertas.push({ area: "Lavado de bandejas", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
-        }
+        if (tengo !== undefined && necesito > tengo) empujarAlerta("Lavado de bandejas", item, necesito, tengo);
       });
     }
     if (nTurnosSel > 0) {
       (insumosConfig.fijo.lavado || []).forEach((item) => {
         const necesito = item.cantXTurno * nTurnosSel;
         const tengo = stockLavado[item.nombre];
-        if (tengo !== undefined && necesito > tengo) {
-          alertas.push({ area: "Lavado de bandejas", nombre: item.nombre, falta: necesito - tengo, formato: item.formato });
-        }
+        if (tengo !== undefined && necesito > tengo) empujarAlerta("Lavado de bandejas", item, necesito, tengo);
       });
     }
 
     return alertas;
-  }, [programas, seleccionInicios, seleccionCierres, envasadoInicios, envasadoCierres, lavadoInicios, lavadoCierres, insumosConfig]);
+  }, [programas, seleccionInicios, seleccionCierres, envasadoInicios, envasadoCierres, lavadoInicios, lavadoCierres, insumosConfig, pedidos]);
 }
 
 // ---------------------------------------------------------------------------
@@ -5160,7 +5225,8 @@ const ITEMS_ENTREGA_DEFAULT = [
   "TRANSPALETAS",
   "RASTRILLOS",
   "TRANSPALETAS ELÉCTRICAS",
-  "H/ABORDO + LLAVES",
+  "HOMBRE A BORDO",
+  "LLAVES",
 ];
 
 // Secuencia de turnos para buscar el registro anterior de recepción
@@ -5182,17 +5248,42 @@ function buildResumenEntrega(record, areaLabel, inicialMap) {
     `Entrega: ${record.entrega || "—"} · Recibe: ${record.recibe || "—"}`,
     "",
   ];
+  // Tabla con solo cantidad inicial y cantidad de entrega — las observaciones
+  // (si las hay) se listan aparte, para que la tabla quede simple y alineada.
   let hayDiferencias = false;
-  (record.items || []).forEach((it) => {
-    const ini = inicialMap ? (inicialMap[it.nombre] ?? "") : "";
-    const cambio = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
-    if (cambio) hayDiferencias = true;
-    if (it.cant || it.obs || cambio) {
-      const flag = cambio ? " ⚠" : "";
-      lines.push(`• ${it.nombre}: Ini ${ini !== "" ? fmtNum(num(ini)) : "—"} → Act ${it.cant !== "" ? fmtNum(num(it.cant)) : "—"}${flag}${it.obs ? ` · ${it.obs}` : ""}`);
-    }
-  });
-  if (hayDiferencias) lines.push("\n⚠ Hay diferencias en cantidades respecto al inicio del turno.");
+  const filas = (record.items || [])
+    .filter((it) => it.cant !== "" || it.obs)
+    .map((it) => {
+      const ini = inicialMap ? (inicialMap[it.nombre] ?? "") : "";
+      const cambio = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
+      if (cambio) hayDiferencias = true;
+      return {
+        nombre: it.nombre,
+        ini: ini !== "" ? fmtNum(num(ini)) : "—",
+        ent: it.cant !== "" ? fmtNum(num(it.cant)) : "—",
+        cambio,
+        obs: it.obs,
+      };
+    });
+  if (filas.length > 0) {
+    const anchoNombre = Math.max(8, ...filas.map((f) => f.nombre.length));
+    lines.push("```");
+    lines.push(`${"Artículo".padEnd(anchoNombre)}  Inicial  Entrega`);
+    filas.forEach((f) => {
+      lines.push(`${f.nombre.padEnd(anchoNombre)}  ${f.ini.padStart(7)}  ${f.ent.padStart(7)}${f.cambio ? " ⚠" : ""}`);
+    });
+    lines.push("```");
+  }
+  const conObs = filas.filter((f) => f.obs);
+  if (conObs.length > 0) {
+    lines.push("");
+    lines.push("*Observaciones:*");
+    conObs.forEach((f) => lines.push(`• ${f.nombre}: ${f.obs}`));
+  }
+  if (hayDiferencias) {
+    lines.push("");
+    lines.push("⚠ Hubo cambios: no se entregaron todos los materiales en la misma cantidad del inicio del turno.");
+  }
   return lines.join("\n");
 }
 
@@ -5321,11 +5412,10 @@ function EntregaMaterialesCard({ areaKey, fecha, turno, autor, supervisoresList 
         <table className="w-full border-collapse text-sm min-w-[480px]">
           <thead>
             <tr className="bg-slate-100">
-              <th className="border border-slate-300 px-3 py-2 text-left   text-xs font-semibold text-slate-600 uppercase tracking-wide w-[34%]">Artículo</th>
-              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-500 uppercase tracking-wide w-[12%]">Inicial</th>
-              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-600 uppercase tracking-wide w-[12%]">Actual</th>
+              <th className="border border-slate-300 px-3 py-2 text-left   text-xs font-semibold text-slate-600 uppercase tracking-wide w-[38%]">Artículo</th>
+              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-500 uppercase tracking-wide w-[16%]">Cant. Inicial</th>
+              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-600 uppercase tracking-wide w-[16%]">Cant. Entrega</th>
               <th className="border border-slate-300 px-3 py-2 text-left   text-xs font-semibold text-slate-600 uppercase tracking-wide">Observación</th>
-              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-600 uppercase tracking-wide w-[12%]">Turno</th>
             </tr>
           </thead>
           <tbody>
@@ -5362,13 +5452,6 @@ function EntregaMaterialesCard({ areaKey, fecha, turno, autor, supervisoresList 
                       value={it.obs}
                       onChange={(e) => setItemField(idx, "obs", e.target.value)}
                     />
-                  </td>
-                  <td className="border border-slate-200 px-2 py-2 text-center align-middle">
-                    <div className="flex flex-col items-center gap-0.5">
-                      <span className="text-xs font-bold text-slate-700 leading-none">{turnoEntrega}</span>
-                      <span className="text-slate-300 text-xs leading-none">↓</span>
-                      <span className="text-xs font-bold text-blue-700 leading-none">{turnoRecibe}</span>
-                    </div>
                   </td>
                 </tr>
               );
@@ -5479,80 +5562,115 @@ function VerificadorHoraScreen({ onBack }) {
 // capturado en el formulario: desglose por tipo de bandeja, por línea, por
 // material, etc.
 // ---------------------------------------------------------------------------
+// Cada resumen*Completo devuelve { dotacion, produccion, materiales }: tres
+// grupos de [label, valor] que se imprimen en ese orden fijo en el mensaje de
+// WhatsApp — dotación global (no desglosada por línea), luego los datos de
+// producción (kg, rendimiento, cumplimiento), y por último los materiales de
+// piso de planta.
 function resumenLavadoInicioCompleto(r) {
-  const items = [
+  const dotacion = [
     ["Operarios", fmtNum(r.operarios || 0)],
     ["Movilizadores", fmtNum(r.movilizadores || 0)],
     ["Jefe de línea", fmtNum(r.jefeLinea || 0)],
     ["¿Dotación completa?", r.dotacionCompleta || "—"],
     ["Comentarios dotación", r.comentariosDotacion || "—"],
   ];
+  const produccion = [];
   TIPOS_BANDEJA.forEach((t) => {
     const v = num(r[`sucios_${t.key}_pallets`]);
-    if (v > 0) items.push([`Sucios · ${t.label}`, `${fmtNum(v)} pallets`]);
+    if (v > 0) produccion.push([`Sucios · ${t.label}`, `${fmtNum(v)} pallets`]);
   });
-  items.push(["Total pallets sucios al iniciar", fmtNum(totalPalletsManual(r, "sucios"))]);
-  return items;
+  produccion.push(["Total pallets sucios al iniciar", fmtNum(totalPalletsManual(r, "sucios"))]);
+  const materiales = [];
+  MATERIALES_LAVADO.forEach((nombre, i) => {
+    const v = num(r[`inicioMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, fmtNum(v)]);
+  });
+  return { dotacion, produccion, materiales };
 }
 
-function resumenLavadoCierreCompleto(r) {
-  const items = [];
+function resumenLavadoCierreCompleto(r, inicio) {
+  const src = inicio || r;
+  const dotacion = [
+    ["Operarios", fmtNum(src.operarios || 0)],
+    ["Movilizadores", fmtNum(src.movilizadores || 0)],
+    ["Jefe de línea", fmtNum(src.jefeLinea || 0)],
+    ["¿Dotación completa?", src.dotacionCompleta || "—"],
+    ["Comentarios dotación", src.comentariosDotacion || "—"],
+  ];
+  const produccion = [];
   TIPOS_BANDEJA.forEach((t) => {
     const v = palletsValue(r, "lavados", t);
-    if (v > 0) items.push([`Lavados · ${t.label}`, `${fmtNum(v)} pallets`]);
+    if (v > 0) produccion.push([`Lavados · ${t.label}`, `${fmtNum(v)} pallets`]);
   });
-  items.push(["Total pallets lavados", fmtNum(totalPalletsFromPrefix(r, "lavados"))]);
+  produccion.push(["Total pallets lavados", fmtNum(totalPalletsFromPrefix(r, "lavados"))]);
   TIPOS_BANDEJA.forEach((t) => {
     const v = num(r[`pendientes_${t.key}_pallets`]);
-    if (v > 0) items.push([`Pendientes · ${t.label}`, `${fmtNum(v)} pallets`]);
+    if (v > 0) produccion.push([`Pendientes · ${t.label}`, `${fmtNum(v)} pallets`]);
   });
-  items.push(["Total pallets pendientes", fmtNum(totalPalletsManual(r, "pendientes"))]);
-  items.push(["Rollos de film", fmtNum(r.rollosFilm || 0)]);
-  items.push(["Bolsas de bins", fmtNum(r.bolsasBins || 0)]);
-  return items;
+  produccion.push(["Total pallets pendientes", fmtNum(totalPalletsManual(r, "pendientes"))]);
+  const materiales = [
+    ["Rollos de film", fmtNum(r.rollosFilm || 0)],
+    ["Bolsas de bins", fmtNum(r.bolsasBins || 0)],
+  ];
+  MATERIALES_LAVADO.forEach((nombre, i) => {
+    const v = num(r[`finMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, fmtNum(v)]);
+  });
+  return { dotacion, produccion, materiales };
 }
 
 function resumenSeleccionInicioCompleto(r) {
-  const items = [];
+  const dotacion = [];
   DOTACION_GENERAL_SELECCION.forEach((label, i) => {
     const v = num(r[`dg_${i}`]);
-    if (v > 0) items.push([label, fmtNum(v)]);
+    if (v > 0) dotacion.push([label, fmtNum(v)]);
   });
-  items.push(["Total dotación", fmtNum(totalDotacionSeleccion(r))]);
-  items.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
-  MATERIALES_SELECCION.forEach((nombre, i) => {
-    const v = num(r[`inicioMat_${i}`]);
-    if (v > 0) items.push([`Material · ${nombre}`, fmtNum(v)]);
-  });
+  dotacion.push(["Total dotación", fmtNum(totalDotacionSeleccion(r))]);
+  dotacion.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
+  dotacion.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
+
+  const produccion = [];
   const activas = LINEAS_SELECCION.filter((l) => r[`linea_${l.key}_activa`] === "Sí");
   if (activas.length === 0) {
-    items.push(["Líneas activas", "Ninguna"]);
+    produccion.push(["Líneas activas", "Ninguna"]);
   } else {
     activas.forEach((l) => {
       const procesos = ESPECIE_SLOTS.map((s) => r[`linea_${l.key}_proceso${sufijoEspecie(s)}`]).filter(Boolean);
-      items.push([`${l.label} · Proceso`, procesos.length ? procesos.join(" + ") : "—"]);
-      items.push([`${l.label} · Dotación`, `${fmtNum(lineaDotacionTotal(r, l))} (${DOTACION_LINEA.map((d, i) => `${d}: ${fmtNum(num(r[`linea_${l.key}_dot${i}`]))}`).join(", ")})`]);
+      produccion.push([`${l.label} · Proceso`, procesos.length ? procesos.join(" + ") : "—"]);
     });
   }
-  items.push(["Armado de materiales", r.armado_activa === "Sí" ? `Activo · Dot. ${fmtNum(armadoDotacionTotal(r))} (${DOTACION_LINEA.map((d, i) => `${d}: ${fmtNum(num(r[`armado_dot${i}`]))}`).join(", ")})` : "Inactivo"]);
-  items.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
-  return items;
+  produccion.push(["Armado de materiales", r.armado_activa === "Sí" ? "Activo" : "Inactivo"]);
+
+  const materiales = [];
+  MATERIALES_SELECCION.forEach((nombre, i) => {
+    const v = num(r[`inicioMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, fmtNum(v)]);
+  });
+
+  return { dotacion, produccion, materiales };
 }
 
 function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
-  const items = [];
-  MATERIALES_SELECCION.forEach((nombre, i) => {
-    const v = num(r[`finMat_${i}`]);
-    if (v > 0) items.push([`Material · ${nombre}`, fmtNum(v)]);
+  const src = inicio || r;
+  const dotacion = [];
+  DOTACION_GENERAL_SELECCION.forEach((label, i) => {
+    const v = num(src[`dg_${i}`]);
+    if (v > 0) dotacion.push([label, fmtNum(v)]);
   });
+  dotacion.push(["Total dotación", fmtNum(totalDotacionSeleccion(src))]);
+  dotacion.push(["¿Dotación completa?", src.dotacionCompleta || "—"]);
+  dotacion.push(["Comentarios dotación", src.comentariosDotacion || "—"]);
+
+  const produccion = [];
   const activas = LINEAS_SELECCION.filter((l) => (inicio?.[`linea_${l.key}_activa`] ?? r[`linea_${l.key}_activa`]) === "Sí");
   if (activas.length === 0) {
-    items.push(["Líneas activas", "Ninguna"]);
+    produccion.push(["Líneas activas", "Ninguna"]);
   } else {
     const rendTotal = computeSeleccionRendimiento({ ...(inicio || {}), ...r });
     const { cumplimiento, kgProgramado, kgIngresado } = computeSeleccionCumplimiento(r, inicio, programaEntries);
-    items.push(["Rendimiento total", fmtPct(rendTotal)]);
-    items.push(["Cumplimiento", kgProgramado ? `${fmtPct(cumplimiento)} (${fmtNum(kgIngresado, 0)}/${fmtNum(kgProgramado, 0)} Kg)` : "Sin Kg programado"]);
+    produccion.push(["Rendimiento total", fmtPct(rendTotal)]);
+    produccion.push(["Cumplimiento", kgProgramado ? `${fmtPct(cumplimiento)} (${fmtNum(kgIngresado, 0)}/${fmtNum(kgProgramado, 0)} Kg)` : "Sin Kg programado"]);
     activas.forEach((l) => {
       const especies = especiesActivasLinea(l, inicio, r);
       especies.forEach(({ s, proceso }) => {
@@ -5560,78 +5678,102 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
         const apr = kgAprobadoTotal(r, l.key, s);
         const rend = ing ? apr / ing : 0;
         const prefijo = especies.length > 1 ? `${l.label} · ${proceso}` : l.label;
-        items.push([`${prefijo} · Kg ingresados`, fmtNum(ing)]);
+        produccion.push([`${prefijo} · Kg ingresados`, fmtNum(ing)]);
         APROBADO_SLOTS.forEach((t) => {
           const tipo = r[`kg_${l.key}_e${s}_apr_t${t}_tipo`];
           const kg = r[`kg_${l.key}_e${s}_apr_t${t}_kg`];
           if (tipo && kg !== undefined && kg !== "") {
-            items.push([`${prefijo} · Aprobado (${tipo})`, fmtNum(num(kg))]);
+            produccion.push([`${prefijo} · Aprobado (${tipo})`, fmtNum(num(kg))]);
           }
         });
-        items.push([`${prefijo} · Kg aprobados total`, fmtNum(apr)]);
-        items.push([`${prefijo} · Rendimiento`, fmtPct(rend)]);
+        produccion.push([`${prefijo} · Kg aprobados total`, fmtNum(apr)]);
+        produccion.push([`${prefijo} · Rendimiento`, fmtPct(rend)]);
       });
     });
   }
-  return items;
+
+  const materiales = [];
+  MATERIALES_SELECCION.forEach((nombre, i) => {
+    const v = num(r[`finMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, fmtNum(v)]);
+  });
+
+  return { dotacion, produccion, materiales };
 }
 
 function resumenEnvasadoInicioCompleto(r) {
-  const items = [];
+  const dotacion = [];
   DOTACION_GENERAL_ENVASADO.forEach((label, i) => {
     const v = num(r[`dg_${i}`]);
-    if (v > 0) items.push([label, v]);
+    if (v > 0) dotacion.push([label, v]);
   });
-  items.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
-  MATERIALES_ENVASADO.forEach((nombre, i) => {
-    const v = num(r[`inicioMat_${i}`]);
-    if (v > 0) items.push([`Material · ${nombre}`, v]);
-  });
+  dotacion.push(["Total dotación", fmtNum(dotacionEnvasadoTotal(r))]);
+  dotacion.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
+  dotacion.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
+
+  const produccion = [];
   if (r.activa_envasadora === "Sí") {
     const mat = r.envasadora_sku ? skuMaterial(r.envasadora_sku) : null;
-    items.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
-    items.push(["Envasadora · Dotación", DOTACION_LINEA.map((d, i) => `${d}: ${fmtNum(num(r[`envasadora_dot${i}`]))}`).join(", ")]);
+    produccion.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
   }
   if (r.activa_linea5 === "Sí") {
-    items.push(["Línea 5 · Especie", r.linea5_especie || "—"]);
-    items.push(["Línea 5 · Dotación", DOTACION_LINEA.map((d, i) => `${d}: ${fmtNum(num(r[`linea5_dot${i}`]))}`).join(", ")]);
+    produccion.push(["Línea 5 · Especie", r.linea5_especie || "—"]);
   }
-  if (r.activa_envasadora !== "Sí" && r.activa_linea5 !== "Sí") items.push(["Líneas de trabajo", "Ninguna activa"]);
-  items.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
-  return items;
+  if (r.activa_envasadora !== "Sí" && r.activa_linea5 !== "Sí") produccion.push(["Líneas de trabajo", "Ninguna activa"]);
+
+  const materiales = [];
+  MATERIALES_ENVASADO.forEach((nombre, i) => {
+    const v = num(r[`inicioMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, v]);
+  });
+
+  return { dotacion, produccion, materiales };
 }
 
 function resumenEnvasadoCierreCompleto(r, inicio) {
-  const items = [];
-  MATERIALES_ENVASADO.forEach((nombre, i) => {
-    const v = num(r[`finMat_${i}`]);
-    if (v > 0) items.push([`Material · ${nombre}`, v]);
+  const src = inicio || r;
+  const dotacion = [];
+  DOTACION_GENERAL_ENVASADO.forEach((label, i) => {
+    const v = num(src[`dg_${i}`]);
+    if (v > 0) dotacion.push([label, v]);
   });
+  dotacion.push(["Total dotación", fmtNum(dotacionEnvasadoTotal(src))]);
+  dotacion.push(["¿Dotación completa?", src.dotacionCompleta || "—"]);
+  dotacion.push(["Comentarios dotación", src.comentariosDotacion || "—"]);
+
+  const produccion = [];
   const activaLinea5 = (inicio?.activa_linea5 ?? r.activa_linea5) === "Sí";
   const activaEnvasadora = (inicio?.activa_envasadora ?? r.activa_envasadora) === "Sí";
   if (activaLinea5) {
     const m = computeEnvasadoMetrics(r);
-    items.push(["Línea 5 · Especie", inicio?.linea5_especie || r.linea5_especie || "—"]);
-    items.push(["Línea 5 · Proceso", r.l5_proceso || "—"]);
-    items.push(["Línea 5 · Kg ingresados", fmtNum(r.l5_kgIngresados || 0)]);
-    items.push(["Línea 5 · Kg aprobados", fmtNum(r.l5_kgAprobados || 0)]);
-    items.push(["Línea 5 · Rendimiento", fmtPct(m.rendimientoLinea5)]);
+    produccion.push(["Línea 5 · Especie", inicio?.linea5_especie || r.linea5_especie || "—"]);
+    produccion.push(["Línea 5 · Proceso", r.l5_proceso || "—"]);
+    produccion.push(["Línea 5 · Kg ingresados", fmtNum(r.l5_kgIngresados || 0)]);
+    produccion.push(["Línea 5 · Kg aprobados", fmtNum(r.l5_kgAprobados || 0)]);
+    produccion.push(["Línea 5 · Rendimiento", fmtPct(m.rendimientoLinea5)]);
   }
   if (activaEnvasadora) {
     const m = computeEnvasadoMetrics(r);
     const mat = r.envasadora_sku ? skuMaterial(r.envasadora_sku) : null;
-    items.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
-    items.push(["Cajas producidas", fmtNum(r.cajasProducidas || 0)]);
-    items.push(["Cajas programadas", fmtNum(r.cajasProgramadas || 0)]);
-    items.push(["Cajas teóricas consumo", fmtNum(r.cajasTeoricas || 0)]);
-    items.push(["Cajas consumidas real", fmtNum(r.cajasConsumidasReal || 0)]);
-    items.push(["Bolsas teóricas consumo", fmtNum(r.bolsasTeoricas || 0)]);
-    items.push(["Bolsas consumidas real", fmtNum(r.bolsasConsumidasReal || 0)]);
-    items.push(["Cumplimiento", fmtPct(m.cumplimiento)]);
-    items.push(["Merma cajas", fmtPct(m.mermaCajas)]);
-    items.push(["Merma bolsas", fmtPct(m.mermaBolsas)]);
+    produccion.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
+    produccion.push(["Cajas producidas", fmtNum(r.cajasProducidas || 0)]);
+    produccion.push(["Cajas programadas", fmtNum(r.cajasProgramadas || 0)]);
+    produccion.push(["Cajas teóricas consumo", fmtNum(r.cajasTeoricas || 0)]);
+    produccion.push(["Cajas consumidas real", fmtNum(r.cajasConsumidasReal || 0)]);
+    produccion.push(["Bolsas teóricas consumo", fmtNum(r.bolsasTeoricas || 0)]);
+    produccion.push(["Bolsas consumidas real", fmtNum(r.bolsasConsumidasReal || 0)]);
+    produccion.push(["Cumplimiento", fmtPct(m.cumplimiento)]);
+    produccion.push(["Merma cajas", fmtPct(m.mermaCajas)]);
+    produccion.push(["Merma bolsas", fmtPct(m.mermaBolsas)]);
   }
-  return items;
+
+  const materiales = [];
+  MATERIALES_ENVASADO.forEach((nombre, i) => {
+    const v = num(r[`finMat_${i}`]);
+    if (v > 0) materiales.push([`Material · ${nombre}`, v]);
+  });
+
+  return { dotacion, produccion, materiales };
 }
 
 // ---------------------------------------------------------------------------
@@ -5655,7 +5797,7 @@ const AREAS = {
       ["Comentarios dotación", r.comentariosDotacion || "—"],
     ],
     resumenCompletoInicio: resumenLavadoInicioCompleto,
-    resumenCompletoCierre: (r) => resumenLavadoCierreCompleto(r),
+    resumenCompletoCierre: (r, inicio) => resumenLavadoCierreCompleto(r, inicio),
     indicator: { label: "Total pallets lavados", format: "number", compute: (r) => totalPalletsFromPrefix(r, "lavados") },
     detailCharts: [
       {
@@ -6558,9 +6700,66 @@ function EnvasadoPortal({ onNavigate, onBack, autor, setAutor, isJefe, onOpenLog
   );
 }
 
+// Fila de un insumo faltante dentro del aviso de Inicio — al presionarla se
+// despliega un pequeño formulario para registrar que ese material SÍ se pidió
+// durante el turno (y cuánto), lo que descuenta al instante lo que falta.
+function AlertaInsumoItem({ alerta, registrarPedido, autor }) {
+  const [abierto, setAbierto] = useState(false);
+  const [cantidad, setCantidad] = useState("");
+  const [guardando, setGuardando] = useState(false);
+  const [ok, setOk] = useState(false);
+
+  const confirmar = async (e) => {
+    e.stopPropagation();
+    const c = num(cantidad);
+    if (!c || c <= 0) return;
+    setGuardando(true);
+    await registrarPedido({ area: alerta.area, nombre: alerta.nombre, cantidad: c, formato: alerta.formato, autor });
+    setGuardando(false);
+    setOk(true);
+    setCantidad("");
+    setTimeout(() => setOk(false), 2000);
+  };
+
+  return (
+    <div className="border-t border-red-200 first:border-t-0 first:pt-0 pt-1.5">
+      <button
+        onClick={(e) => { e.stopPropagation(); setAbierto((v) => !v); }}
+        className="w-full text-left flex items-center justify-between gap-2 py-0.5"
+      >
+        <span className="text-xs text-red-700">
+          {alerta.nombre} — faltan {fmtNum(alerta.falta, 2)} {alerta.formato}
+          {alerta.pedido > 0 ? <span className="text-emerald-700 font-medium"> (ya pedido: {fmtNum(alerta.pedido, 2)})</span> : null}
+        </span>
+        <span className="text-red-400 text-xs shrink-0">{abierto ? "▲" : "▼"}</span>
+      </button>
+      {abierto && (
+        <div className="flex items-center gap-2 pt-1.5 pb-2" onClick={(e) => e.stopPropagation()}>
+          <input
+            type="text"
+            inputMode="decimal"
+            className="w-24 text-sm border border-red-300 rounded-lg px-2 py-1.5 bg-white"
+            placeholder={`Cant. ${alerta.formato}`}
+            value={cantidad}
+            onChange={(e) => setCantidad(e.target.value.replace(/[^0-9.,]/g, ""))}
+          />
+          <button
+            onClick={confirmar}
+            disabled={guardando || !cantidad}
+            className="text-xs font-semibold bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-lg px-3 py-1.5 transition-colors"
+          >
+            {ok ? "✓ Registrado" : guardando ? "Guardando…" : "Ya se pidió durante el turno"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Home principal ───────────────────────────────────────────────────────────
-function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe }) {
+function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
   const alertasInsumos = useAlertasInsumos();
+  const { registrarPedido } = usePedidosInsumos();
 
   return (
     <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-8">
@@ -6587,23 +6786,28 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe }) {
         return (
           <div className="px-4 mb-4 space-y-2">
             {areas.map((areaNombre) => (
-              <button
-                key={areaNombre}
-                onClick={() => onNavigate(areaNombre === "Envasado" ? "insumos-envasado" : "insumos-seleccion")}
-                className="w-full text-left bg-red-50 border border-red-300 rounded-2xl px-4 py-3 flex items-start gap-3 hover:bg-red-100 transition-colors"
-              >
-                <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-bold text-red-800">
-                    {areaNombre}: {porArea[areaNombre].length} insumo{porArea[areaNombre].length > 1 ? "s" : ""} no va{porArea[areaNombre].length > 1 ? "n" : ""} a alcanzar para hoy/mañana
+              <div key={areaNombre} className="bg-red-50 border border-red-300 rounded-2xl px-4 py-3">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-bold text-red-800">
+                      {areaNombre}: {porArea[areaNombre].length} insumo{porArea[areaNombre].length > 1 ? "s" : ""} no va{porArea[areaNombre].length > 1 ? "n" : ""} a alcanzar para hoy/mañana
+                    </div>
+                    <div className="text-xs text-red-600 mt-0.5">Presiona un insumo para indicar si ya se pidió durante el turno.</div>
                   </div>
-                  <div className="text-xs text-red-700 mt-0.5 truncate">
-                    {porArea[areaNombre].slice(0, 3).map((a) => a.nombre).join(" · ")}
-                    {porArea[areaNombre].length > 3 ? ` · +${porArea[areaNombre].length - 3} más` : ""}
-                  </div>
-                  <div className="text-xs text-red-600 mt-1 underline">Ver detalle en Insumos de {areaNombre} →</div>
                 </div>
-              </button>
+                <div className="mt-1 ml-8">
+                  {porArea[areaNombre].map((a) => (
+                    <AlertaInsumoItem key={`${a.area}-${a.nombre}`} alerta={a} registrarPedido={registrarPedido} autor={autor} />
+                  ))}
+                </div>
+                <button
+                  onClick={() => onNavigate(areaNombre === "Envasado" ? "insumos-envasado" : "insumos-seleccion")}
+                  className="text-xs text-red-600 underline mt-2 ml-8"
+                >
+                  Ver detalle en Insumos de {areaNombre} →
+                </button>
+              </div>
             ))}
           </div>
         );
@@ -6745,6 +6949,7 @@ export default function App() {
           isJefe={isJefe}
           onOpenLogin={() => setShowLogin(true)}
           onLogoutJefe={() => setJefeFlag("")}
+          autor={portalProps.autor}
         />
       )}
 
