@@ -217,12 +217,61 @@ const SHARED_LIST_CACHE = new Map();   // key -> { value, ts }
 const SHARED_LIST_INFLIGHT = new Map(); // key -> Promise en curso
 const SHARED_TTL_MS = 20000; // 20 segundos
 
+// Estas dos claves no son filas simples de la hoja "Storage": el servidor
+// las arma leyendo/combinando otras pestañas (SKU y Procesos del Sheet), así
+// que quedan fuera del pedido agrupado de abajo y siguen pidiéndose una por
+// una con window.storage.get.
+const CLAVES_NO_AGRUPABLES = new Set(["sku-nuevos", "procesos-extra"]);
+
+// Agrupa en UNA sola petición HTTP todas las claves compartidas que varios
+// componentes piden "al mismo tiempo" (mismo ciclo de eventos) — por ejemplo
+// al abrir Inicio de turno, que dispara 8-10 useSharedList de golpe (programa
+// del día + inicios/cierres de las 3 áreas para las alertas de insumos).
+// Antes cada una era su propia petición de red a Apps Script, que es lento
+// por naturaleza; ahora se juntan y se piden todas juntas.
+let LOTE_PENDIENTE = new Set();
+let LOTE_ESPERANDO = new Map(); // key -> [{ resolve, reject }, ...]
+let LOTE_TIMER = null;
+
+function despacharLote() {
+  const claves = Array.from(LOTE_PENDIENTE);
+  const esperando = new Map(LOTE_ESPERANDO);
+  LOTE_PENDIENTE = new Set();
+  LOTE_ESPERANDO = new Map();
+  LOTE_TIMER = null;
+
+  window.storage.getMany(claves).then((valores) => {
+    claves.forEach((k) => {
+      (esperando.get(k) || []).forEach(({ resolve }) => resolve(valores[k]));
+    });
+  }).catch((err) => {
+    claves.forEach((k) => {
+      (esperando.get(k) || []).forEach(({ reject }) => reject(err));
+    });
+  });
+}
+
+function pedirClaveAgrupada(key) {
+  return new Promise((resolve, reject) => {
+    LOTE_PENDIENTE.add(key);
+    if (!LOTE_ESPERANDO.has(key)) LOTE_ESPERANDO.set(key, []);
+    LOTE_ESPERANDO.get(key).push({ resolve, reject });
+    // setTimeout(…, 0) en vez de una microtarea: junta todas las peticiones
+    // que se disparan en la misma pasada de renderizado (varios hooks
+    // useSharedList montando a la vez), sin esperar tanto como para que se
+    // note una demora extra.
+    if (!LOTE_TIMER) LOTE_TIMER = setTimeout(despacharLote, 0);
+  });
+}
+
 function fetchSharedListKey(key) {
   if (SHARED_LIST_INFLIGHT.has(key)) return SHARED_LIST_INFLIGHT.get(key);
   const p = (async () => {
     try {
-      const res = await window.storage.get(key, true);
-      const val = res ? JSON.parse(res.value) : [];
+      const raw = CLAVES_NO_AGRUPABLES.has(key)
+        ? (await window.storage.get(key, true))?.value
+        : await pedirClaveAgrupada(key);
+      const val = raw ? JSON.parse(raw) : [];
       SHARED_LIST_CACHE.set(key, { value: val, ts: Date.now() });
       return val;
     } catch {
@@ -286,6 +335,12 @@ function useSharedList(key) {
       const res = await window.storage.set(key, JSON.stringify(newItems), true);
       if (!res) {
         setError("El almacenamiento no respondió. El cambio quedó en esta sesión pero no se sincronizó: vuelve a presionar Guardar.");
+        return false;
+      }
+      if (res.syncError) {
+        // Se guardó en este dispositivo, pero Google Sheets no lo confirmó
+        // (antes esto pasaba en silencio — ver window.storage.set en main.jsx).
+        setError(`Se guardó en este dispositivo, pero no se pudo sincronizar con Google Sheets (${res.syncError}). Vuelve a presionar Guardar cuando tengas señal.`);
         return false;
       }
       setError(null);
