@@ -1791,13 +1791,68 @@ function useAlertasInsumos() {
 // INSUMOS Y CONSUMO (pantalla)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Filas de insumos (módulo nivel — no anidar dentro de otro componente)
+// Mapa areaKey ("seleccion"/"envasado"/"lavado", como usa InsumosConsumoScreen)
+// -> el mismo texto de área que usa useAlertasInsumos/usePedidosInsumos, para
+// que un pedido registrado en una fila quede etiquetado igual que la alerta
+// que intenta descontar.
 // ---------------------------------------------------------------------------
-function RowInsumo({ item, kgTotal, stockMap }) {
+const AREA_LABEL_INSUMOS = { seleccion: "Selección", envasado: "Envasado", lavado: "Lavado de bandejas" };
+
+// Formulario chico para registrar que un insumo con falta SÍ se pidió a
+// bodega durante el turno — usado dentro de RowInsumo/RowFijo cuando hay
+// quiebre. Al guardar, useAlertasInsumos() descuenta esa cantidad de
+// inmediato (sin esperar a un nuevo Cierre), así el aviso de faltante se
+// actualiza solo.
+function RegistrarPedidoForm({ area, nombre, formato, registrarPedido, autor, onDone }) {
+  const [cantidad, setCantidad] = useState("");
+  const [guardando, setGuardando] = useState(false);
+  const [ok, setOk] = useState(false);
+
+  const confirmar = async () => {
+    const c = num(cantidad);
+    if (!c || c <= 0) return;
+    setGuardando(true);
+    await registrarPedido({ area, nombre, cantidad: c, formato, autor });
+    setGuardando(false);
+    setOk(true);
+    setCantidad("");
+    setTimeout(() => { setOk(false); onDone && onDone(); }, 1200);
+  };
+
+  return (
+    <div className="flex items-center gap-2 mt-1.5">
+      <input
+        type="text"
+        inputMode="decimal"
+        className="w-24 text-sm border border-red-300 rounded-lg px-2 py-1.5 bg-white"
+        placeholder={`Cant. ${formato}`}
+        value={cantidad}
+        onChange={(e) => setCantidad(e.target.value.replace(/[^0-9.,]/g, ""))}
+      />
+      <button
+        onClick={confirmar}
+        disabled={guardando || !cantidad}
+        className="text-xs font-semibold bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-lg px-3 py-1.5 transition-colors"
+      >
+        {ok ? "✓ Registrado" : guardando ? "Guardando…" : "Confirmar pedido"}
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Filas de insumos (módulo nivel — no anidar dentro de otro componente)
+// `pedido` = cuánto ya se registró como pedido durante el turno para este
+// insumo (proviene de usePedidosInsumos) — se suma al stock antes de decidir
+// si falta, así que apenas se registra un pedido el aviso se actualiza solo.
+// ---------------------------------------------------------------------------
+function RowInsumo({ item, kgTotal, stockMap, area, pedido = 0, registrarPedido, autor }) {
+  const [abierto, setAbierto] = useState(false);
   const formatos  = kgTotal > 0 ? calcFormatos(kgTotal, item) : 0;
   const solicitar = Math.ceil(formatos - 1e-9);          // unidades enteras a pedir a bodega
   const tengo     = stockMap ? (stockMap[item.nombre] ?? null) : null;
-  const diff      = tengo !== null ? tengo - formatos : null;
+  const tengoEfectivo = tengo !== null ? tengo + pedido : null;
+  const diff      = tengoEfectivo !== null ? tengoEfectivo - formatos : null;
   const falta     = diff !== null && diff < 0;
   const fmt       = item.formato;
   const baseLabel = item.unidadBase || "Kg";
@@ -1824,6 +1879,7 @@ function RowInsumo({ item, kgTotal, stockMap }) {
           {tengo !== null ? (
             <>
               <div><span className="text-slate-500">Tengo </span><b>{fmtNum(tengo, 2)}</b></div>
+              {pedido > 0 && <div className="text-emerald-600">+ pedido {fmtNum(pedido, 2)}</div>}
               <div className={falta ? "text-red-700 font-bold" : "text-emerald-700 font-semibold"}>
                 {falta ? `⚠ Faltan ${fmtNum(Math.abs(diff), 2)}` : `✓ OK`}
               </div>
@@ -1834,16 +1890,29 @@ function RowInsumo({ item, kgTotal, stockMap }) {
       {formatos > 0 && formatos !== solicitar && (
         <div className="text-xs text-slate-400 mt-1">Cálculo exacto: {fmtNum(formatos, 3)} {fmt}s → se redondea arriba</div>
       )}
+      {falta && area && registrarPedido && (
+        <div className="mt-2 pt-2 border-t border-red-200">
+          {!abierto ? (
+            <button onClick={() => setAbierto(true)} className="text-xs font-semibold text-red-700 underline">
+              ¿Ya se pidió a bodega? Registrar cantidad pedida
+            </button>
+          ) : (
+            <RegistrarPedidoForm area={area} nombre={item.nombre} formato={fmt} registrarPedido={registrarPedido} autor={autor} onDone={() => setAbierto(false)} />
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-function RowFijo({ item, nTurnos, stockMap }) {
+function RowFijo({ item, nTurnos, stockMap, area, pedido = 0, registrarPedido, autor }) {
+  const [abierto, setAbierto] = useState(false);
   const necesito  = item.cantXTurno * nTurnos;
   const solicitar = Math.ceil(necesito - 1e-9);
   const fmt       = item.formato;
   const tengo     = stockMap ? (stockMap[item.nombre] ?? null) : null;
-  const diff      = tengo !== null ? tengo - necesito : null;
+  const tengoEfectivo = tengo !== null ? (typeof tengo === "number" ? tengo + pedido : tengo) : null;
+  const diff      = typeof tengoEfectivo === "number" ? tengoEfectivo - necesito : null;
   const falta     = diff !== null && diff < 0;
   return (
     <div className={`rounded-xl px-3 py-2.5 border mb-2 last:mb-0 ${falta ? "bg-red-50 border-red-200" : tengo !== null ? "bg-emerald-50 border-emerald-200" : "bg-white border-slate-200"}`}>
@@ -1867,6 +1936,7 @@ function RowFijo({ item, nTurnos, stockMap }) {
           {tengo !== null ? (
             <>
               <div><span className="text-slate-500">Tengo </span><b>{typeof tengo === "number" ? fmtNum(tengo, 2) : tengo}</b></div>
+              {pedido > 0 && <div className="text-emerald-600">+ pedido {fmtNum(pedido, 2)}</div>}
               <div className={falta ? "text-red-700 font-bold" : "text-emerald-700 font-semibold"}>
                 {falta ? `⚠ Faltan ${fmtNum(Math.abs(diff), 2)}` : `✓ OK`}
               </div>
@@ -1876,6 +1946,17 @@ function RowFijo({ item, nTurnos, stockMap }) {
       </div>
       {necesito > 0 && necesito !== solicitar && (
         <div className="text-xs text-slate-400 mt-1">Cálculo exacto: {fmtNum(necesito, 2)} {fmt}s</div>
+      )}
+      {falta && area && registrarPedido && (
+        <div className="mt-2 pt-2 border-t border-red-200">
+          {!abierto ? (
+            <button onClick={() => setAbierto(true)} className="text-xs font-semibold text-red-700 underline">
+              ¿Ya se pidió a bodega? Registrar cantidad pedida
+            </button>
+          ) : (
+            <RegistrarPedidoForm area={area} nombre={item.nombre} formato={fmt} registrarPedido={registrarPedido} autor={autor} onDone={() => setAbierto(false)} />
+          )}
+        </div>
       )}
     </div>
   );
@@ -1930,21 +2011,26 @@ function GlosarioInsumos() {
 // Sección de insumos fijos por turno — componente de módulo (no anidar dentro
 // de InsumosConsumoScreen, o React pierde la identidad del componente en
 // cada render y lanza el error #130).
-function SeccionFijos({ areaKey, stockMap, titulo, insumosFijo, nTurnos }) {
+function SeccionFijos({ areaKey, stockMap, titulo, insumosFijo, nTurnos, pedidoDe, registrarPedido, autor }) {
   const items = insumosFijo[areaKey] || [];
   if (!items.length) return null;
+  const area = AREA_LABEL_INSUMOS[areaKey];
   return (
     <Card title={`${titulo} — Fijos por turno`}>
       {nTurnos === 0
         ? <EmptyNote text="Selecciona al menos un turno." />
         : items.map((item) => (
-            <RowFijo key={item.nombre} item={item} nTurnos={nTurnos} stockMap={stockMap} />
+            <RowFijo
+              key={item.nombre} item={item} nTurnos={nTurnos} stockMap={stockMap}
+              area={area} pedido={pedidoDe ? pedidoDe(area, item.nombre) : 0}
+              registrarPedido={registrarPedido} autor={autor}
+            />
           ))}
     </Card>
   );
 }
 
-function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
+function InsumosConsumoScreen({ isJefe, onBack, areaFiltro, autor }) {
   const [programas]        = useSharedList("programa-records");
   const [lavadoInicios]    = useSharedList("lavado-inicio-records");
   const [lavadoCierres]    = useSharedList("lavado-cierre-records");
@@ -1955,6 +2041,23 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
   const { config: insumosConfig } = useInsumosConfig();
   const INSUMOS_VARIABLE = insumosConfig.variable;
   const INSUMOS_FIJO     = insumosConfig.fijo;
+
+  // Pedidos hechos a bodega durante el turno — misma ventana (hoy/mañana) que
+  // usa useAlertasInsumos, para que "cuánto ya se pidió" se vea igual acá que
+  // en el aviso de la pantalla de Inicio.
+  const { pedidos, registrarPedido } = usePedidosInsumos();
+  const pedidoDe = useMemo(() => {
+    const hoy = today();
+    const manana = nextDateISO(hoy);
+    const ventana = [hoy, manana];
+    const mapa = {};
+    pedidos.forEach((p) => {
+      if (!ventana.includes(p.fecha)) return;
+      const k = `${p.area}||${p.nombre}`;
+      mapa[k] = (mapa[k] || 0) + num(p.cantidad);
+    });
+    return (area, nombre) => mapa[`${area}||${nombre}`] || 0;
+  }, [pedidos]);
 
   const [fecha, setFecha]             = useState(today());
   // Turnos que realmente opera la planta (define el patrón de cobertura de bodega).
@@ -2198,7 +2301,11 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
                       {fmtNum(desglose.kgSeleccionTotal, 0)} Kg programados ≈ <b>{fmtNum(desglose.palletsSeleccion, 2)} pallets</b> (953,4 Kg/pallet).
                     </p>
                     {(INSUMOS_VARIABLE.seleccion || []).map((item) => (
-                      <RowInsumo key={item.nombre} item={item} kgTotal={desglose.palletsSeleccion} stockMap={stockSeleccion} />
+                      <RowInsumo
+                        key={item.nombre} item={item} kgTotal={desglose.palletsSeleccion} stockMap={stockSeleccion}
+                        area="Selección" pedido={pedidoDe("Selección", item.nombre)}
+                        registrarPedido={registrarPedido} autor={autor}
+                      />
                     ))}
                   </>
                 )}
@@ -2233,7 +2340,7 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
               )}
             </Card>
 
-            <SeccionFijos areaKey="seleccion" stockMap={stockSeleccion} titulo="Selección" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} />
+            <SeccionFijos areaKey="seleccion" stockMap={stockSeleccion} titulo="Selección" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} pedidoDe={pedidoDe} registrarPedido={registrarPedido} autor={autor} />
 
             <Card title="Selección — Paquete Bolsas Bins Azules (condicional)">
               <RowFijo
@@ -2248,10 +2355,14 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
                 Pallets de bandejas pendientes (según el último cierre de Lavado registrado): <b>{palletsBandejasLavado}</b>
               </p>
               {(INSUMOS_VARIABLE.lavado || []).map((item) => (
-                <RowInsumo key={item.nombre} item={item} kgTotal={palletsBandejasLavado} stockMap={stockLavado} />
+                <RowInsumo
+                  key={item.nombre} item={item} kgTotal={palletsBandejasLavado} stockMap={stockLavado}
+                  area="Lavado de bandejas" pedido={pedidoDe("Lavado de bandejas", item.nombre)}
+                  registrarPedido={registrarPedido} autor={autor}
+                />
               ))}
             </Card>
-            <SeccionFijos areaKey="lavado" stockMap={stockLavado} titulo="Lavado de bandejas" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} />
+            <SeccionFijos areaKey="lavado" stockMap={stockLavado} titulo="Lavado de bandejas" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} pedidoDe={pedidoDe} registrarPedido={registrarPedido} autor={autor} />
           </>
         )}
 
@@ -2269,13 +2380,17 @@ function InsumosConsumoScreen({ isJefe, onBack, areaFiltro }) {
                     Total: <b>{fmtNum(desglose.palletsEnvasadoTotal, 2)} pallets</b>.
                   </p>
                   {(INSUMOS_VARIABLE.envasado || []).map((item) => (
-                    <RowInsumo key={item.nombre} item={item} kgTotal={desglose.palletsEnvasadoTotal} stockMap={stockEnvasado} />
+                    <RowInsumo
+                      key={item.nombre} item={item} kgTotal={desglose.palletsEnvasadoTotal} stockMap={stockEnvasado}
+                      area="Envasado" pedido={pedidoDe("Envasado", item.nombre)}
+                      registrarPedido={registrarPedido} autor={autor}
+                    />
                   ))}
                 </>
               )}
             </Card>
 
-            <SeccionFijos areaKey="envasado" stockMap={stockEnvasado} titulo="Envasado" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} />
+            <SeccionFijos areaKey="envasado" stockMap={stockEnvasado} titulo="Envasado" insumosFijo={INSUMOS_FIJO} nTurnos={nTurnos} pedidoDe={pedidoDe} registrarPedido={registrarPedido} autor={autor} />
 
             <Card title="Envasado — Bolsas y Cajas por SKU">
               {skuNecesidades.length === 0 ? (
@@ -5247,39 +5362,23 @@ function buildResumenEntrega(record, areaLabel, inicialMap) {
     `${tE} → ${tR}`,
     `Entrega: ${record.entrega || "—"} · Recibe: ${record.recibe || "—"}`,
     "",
+    "*Artículos (Inicial → Entrega):*",
   ];
-  // Tabla con solo cantidad inicial y cantidad de entrega — las observaciones
-  // (si las hay) se listan aparte, para que la tabla quede simple y alineada.
+  // Una línea por artículo con solo cantidad inicial y cantidad de entrega
+  // (sin bloque de código — algunos clientes de WhatsApp no muestran bien el
+  // texto dentro de ```, y hacía desaparecer tabla y observaciones).
   let hayDiferencias = false;
-  const filas = (record.items || [])
-    .filter((it) => it.cant !== "" || it.obs)
-    .map((it) => {
-      const ini = inicialMap ? (inicialMap[it.nombre] ?? "") : "";
-      const cambio = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
-      if (cambio) hayDiferencias = true;
-      return {
-        nombre: it.nombre,
-        ini: ini !== "" ? fmtNum(num(ini)) : "—",
-        ent: it.cant !== "" ? fmtNum(num(it.cant)) : "—",
-        cambio,
-        obs: it.obs,
-      };
-    });
-  if (filas.length > 0) {
-    const anchoNombre = Math.max(8, ...filas.map((f) => f.nombre.length));
-    lines.push("```");
-    lines.push(`${"Artículo".padEnd(anchoNombre)}  Inicial  Entrega`);
-    filas.forEach((f) => {
-      lines.push(`${f.nombre.padEnd(anchoNombre)}  ${f.ini.padStart(7)}  ${f.ent.padStart(7)}${f.cambio ? " ⚠" : ""}`);
-    });
-    lines.push("```");
-  }
-  const conObs = filas.filter((f) => f.obs);
-  if (conObs.length > 0) {
-    lines.push("");
-    lines.push("*Observaciones:*");
-    conObs.forEach((f) => lines.push(`• ${f.nombre}: ${f.obs}`));
-  }
+  (record.items || []).forEach((it) => {
+    if (it.cant === "" && !it.obs) return; // sin datos para este artículo — se omite
+    const ini = inicialMap ? (inicialMap[it.nombre] ?? "") : "";
+    const cambio = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
+    if (cambio) hayDiferencias = true;
+    const iniTxt = ini !== "" ? fmtNum(num(ini)) : "—";
+    const entTxt = it.cant !== "" ? fmtNum(num(it.cant)) : "—";
+    const flag = cambio ? " ⚠" : "";
+    const obsTxt = it.obs ? ` · Obs: ${it.obs}` : "";
+    lines.push(`• ${it.nombre}: ${iniTxt} → ${entTxt}${flag}${obsTxt}`);
+  });
   if (hayDiferencias) {
     lines.push("");
     lines.push("⚠ Hubo cambios: no se entregaron todos los materiales en la misma cantidad del inicio del turno.");
@@ -5620,12 +5719,37 @@ function resumenLavadoCierreCompleto(r, inicio) {
   return { dotacion, produccion, materiales };
 }
 
+// Total por puesto (Operarios, Movilizadores, Jefe de Línea) sumando TODAS
+// las líneas activas (+ armado en Selección; + Envasadora/Línea 5 en
+// Envasado) — a diferencia del desglose por línea, esto da un solo número
+// por cargo para todo el turno.
+function totalesPorPuestoSeleccion(r) {
+  return DOTACION_LINEA.map((label, i) => {
+    let t = 0;
+    LINEAS_SELECCION.forEach((l) => {
+      if (r[`linea_${l.key}_activa`] === "Sí") t += num(r[`linea_${l.key}_dot${i}`]);
+    });
+    if (r.armado_activa === "Sí") t += num(r[`armado_dot${i}`]);
+    return [`Total ${label}`, fmtNum(t)];
+  });
+}
+
+function totalesPorPuestoEnvasado(r) {
+  return DOTACION_LINEA.map((label, i) => {
+    let t = 0;
+    if (r.activa_envasadora === "Sí") t += num(r[`envasadora_dot${i}`]);
+    if (r.activa_linea5 === "Sí") t += num(r[`linea5_dot${i}`]);
+    return [`Total ${label}`, fmtNum(t)];
+  });
+}
+
 function resumenSeleccionInicioCompleto(r) {
   const dotacion = [];
   DOTACION_GENERAL_SELECCION.forEach((label, i) => {
     const v = num(r[`dg_${i}`]);
     if (v > 0) dotacion.push([label, fmtNum(v)]);
   });
+  dotacion.push(...totalesPorPuestoSeleccion(r));
   dotacion.push(["Total dotación", fmtNum(totalDotacionSeleccion(r))]);
   dotacion.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
   dotacion.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
@@ -5658,6 +5782,7 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
     const v = num(src[`dg_${i}`]);
     if (v > 0) dotacion.push([label, fmtNum(v)]);
   });
+  dotacion.push(...totalesPorPuestoSeleccion(src));
   dotacion.push(["Total dotación", fmtNum(totalDotacionSeleccion(src))]);
   dotacion.push(["¿Dotación completa?", src.dotacionCompleta || "—"]);
   dotacion.push(["Comentarios dotación", src.comentariosDotacion || "—"]);
@@ -5707,6 +5832,7 @@ function resumenEnvasadoInicioCompleto(r) {
     const v = num(r[`dg_${i}`]);
     if (v > 0) dotacion.push([label, v]);
   });
+  dotacion.push(...totalesPorPuestoEnvasado(r));
   dotacion.push(["Total dotación", fmtNum(dotacionEnvasadoTotal(r))]);
   dotacion.push(["¿Dotación completa?", r.dotacionCompleta || "—"]);
   dotacion.push(["Comentarios dotación", r.comentariosDotacion || "—"]);
@@ -5737,6 +5863,7 @@ function resumenEnvasadoCierreCompleto(r, inicio) {
     const v = num(src[`dg_${i}`]);
     if (v > 0) dotacion.push([label, v]);
   });
+  dotacion.push(...totalesPorPuestoEnvasado(src));
   dotacion.push(["Total dotación", fmtNum(dotacionEnvasadoTotal(src))]);
   dotacion.push(["¿Dotación completa?", src.dotacionCompleta || "—"]);
   dotacion.push(["Comentarios dotación", src.comentariosDotacion || "—"]);
@@ -6700,66 +6827,9 @@ function EnvasadoPortal({ onNavigate, onBack, autor, setAutor, isJefe, onOpenLog
   );
 }
 
-// Fila de un insumo faltante dentro del aviso de Inicio — al presionarla se
-// despliega un pequeño formulario para registrar que ese material SÍ se pidió
-// durante el turno (y cuánto), lo que descuenta al instante lo que falta.
-function AlertaInsumoItem({ alerta, registrarPedido, autor }) {
-  const [abierto, setAbierto] = useState(false);
-  const [cantidad, setCantidad] = useState("");
-  const [guardando, setGuardando] = useState(false);
-  const [ok, setOk] = useState(false);
-
-  const confirmar = async (e) => {
-    e.stopPropagation();
-    const c = num(cantidad);
-    if (!c || c <= 0) return;
-    setGuardando(true);
-    await registrarPedido({ area: alerta.area, nombre: alerta.nombre, cantidad: c, formato: alerta.formato, autor });
-    setGuardando(false);
-    setOk(true);
-    setCantidad("");
-    setTimeout(() => setOk(false), 2000);
-  };
-
-  return (
-    <div className="border-t border-red-200 first:border-t-0 first:pt-0 pt-1.5">
-      <button
-        onClick={(e) => { e.stopPropagation(); setAbierto((v) => !v); }}
-        className="w-full text-left flex items-center justify-between gap-2 py-0.5"
-      >
-        <span className="text-xs text-red-700">
-          {alerta.nombre} — faltan {fmtNum(alerta.falta, 2)} {alerta.formato}
-          {alerta.pedido > 0 ? <span className="text-emerald-700 font-medium"> (ya pedido: {fmtNum(alerta.pedido, 2)})</span> : null}
-        </span>
-        <span className="text-red-400 text-xs shrink-0">{abierto ? "▲" : "▼"}</span>
-      </button>
-      {abierto && (
-        <div className="flex items-center gap-2 pt-1.5 pb-2" onClick={(e) => e.stopPropagation()}>
-          <input
-            type="text"
-            inputMode="decimal"
-            className="w-24 text-sm border border-red-300 rounded-lg px-2 py-1.5 bg-white"
-            placeholder={`Cant. ${alerta.formato}`}
-            value={cantidad}
-            onChange={(e) => setCantidad(e.target.value.replace(/[^0-9.,]/g, ""))}
-          />
-          <button
-            onClick={confirmar}
-            disabled={guardando || !cantidad}
-            className="text-xs font-semibold bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-lg px-3 py-1.5 transition-colors"
-          >
-            {ok ? "✓ Registrado" : guardando ? "Guardando…" : "Ya se pidió durante el turno"}
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Home principal ───────────────────────────────────────────────────────────
 function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
   const alertasInsumos = useAlertasInsumos();
-  const { registrarPedido } = usePedidosInsumos();
 
   return (
     <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-8">
@@ -6786,28 +6856,23 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
         return (
           <div className="px-4 mb-4 space-y-2">
             {areas.map((areaNombre) => (
-              <div key={areaNombre} className="bg-red-50 border border-red-300 rounded-2xl px-4 py-3">
-                <div className="flex items-start gap-3">
-                  <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-bold text-red-800">
-                      {areaNombre}: {porArea[areaNombre].length} insumo{porArea[areaNombre].length > 1 ? "s" : ""} no va{porArea[areaNombre].length > 1 ? "n" : ""} a alcanzar para hoy/mañana
-                    </div>
-                    <div className="text-xs text-red-600 mt-0.5">Presiona un insumo para indicar si ya se pidió durante el turno.</div>
+              <button
+                key={areaNombre}
+                onClick={() => onNavigate(areaNombre === "Envasado" ? "insumos-envasado" : "insumos-seleccion")}
+                className="w-full text-left bg-red-50 border border-red-300 rounded-2xl px-4 py-3 flex items-start gap-3 hover:bg-red-100 transition-colors"
+              >
+                <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-bold text-red-800">
+                    {areaNombre}: {porArea[areaNombre].length} insumo{porArea[areaNombre].length > 1 ? "s" : ""} no va{porArea[areaNombre].length > 1 ? "n" : ""} a alcanzar para hoy/mañana
                   </div>
+                  <div className="text-xs text-red-700 mt-0.5 truncate">
+                    {porArea[areaNombre].slice(0, 3).map((a) => a.nombre).join(" · ")}
+                    {porArea[areaNombre].length > 3 ? ` · +${porArea[areaNombre].length - 3} más` : ""}
+                  </div>
+                  <div className="text-xs text-red-600 mt-1 underline">Ir a Insumos de {areaNombre} a registrar el pedido →</div>
                 </div>
-                <div className="mt-1 ml-8">
-                  {porArea[areaNombre].map((a) => (
-                    <AlertaInsumoItem key={`${a.area}-${a.nombre}`} alerta={a} registrarPedido={registrarPedido} autor={autor} />
-                  ))}
-                </div>
-                <button
-                  onClick={() => onNavigate(areaNombre === "Envasado" ? "insumos-envasado" : "insumos-seleccion")}
-                  className="text-xs text-red-600 underline mt-2 ml-8"
-                >
-                  Ver detalle en Insumos de {areaNombre} →
-                </button>
-              </div>
+              </button>
             ))}
           </div>
         );
@@ -6974,10 +7039,10 @@ export default function App() {
 
       {/* Insumos filtrados por área */}
       {screen === "insumos-seleccion" && (
-        <InsumosConsumoScreen isJefe={isJefe} areaFiltro="seleccion" onBack={() => setScreen("portal-seleccion")} />
+        <InsumosConsumoScreen isJefe={isJefe} areaFiltro="seleccion" onBack={() => setScreen("portal-seleccion")} autor={portalProps.autor} />
       )}
       {screen === "insumos-envasado" && (
-        <InsumosConsumoScreen isJefe={isJefe} areaFiltro="envasado" onBack={() => setScreen("portal-envasado")} />
+        <InsumosConsumoScreen isJefe={isJefe} areaFiltro="envasado" onBack={() => setScreen("portal-envasado")} autor={portalProps.autor} />
       )}
 
       {/* Verificador — accesible desde el portal Envasado */}
