@@ -1425,24 +1425,24 @@ function incidentesDeCierre(record) {
   return [{ nombre: "", descripcion: "", docHecha: "", docEntregada: "" }];
 }
 
-function buildResumenWhatsapp(area, record, inicio, programaEntries) {
-  const ind = area.indicator;
-  const valorInd = ind.compute(record);
-  const indTexto = ind.format === "pct" ? fmtPct(valorInd) : String(valorInd);
+function buildResumenWhatsapp(area, record, inicio, programaEntries, horarios) {
+  // Ojo: NO se muestra area.indicator aquí arriba — para Selección ese
+  // indicador se calcula solo con el registro de Cierre (sin fusionar el
+  // Inicio), que no trae las líneas activas, así que siempre daba 0% y
+  // quedaba redundante con "Rendimiento total"/"Cumplimiento" que ya se
+  // muestran, correctamente calculados, dentro de *Producción* más abajo.
   const lineas = [
     `*Bitácora de Turnos – ${area.title}*`,
     `Cierre de turno`,
     `Fecha: ${fmtFecha(record.fecha)} · Turno: ${turnoLabel(record.turno)}`,
     `Responsable: ${record.responsable || "—"}`,
     "",
-    `${ind.label}: ${indTexto}`,
-    "",
   ];
   // Orden fijo del mensaje: 1) dotación global (no por línea), 2) datos de
   // producción (kg, rendimiento, cumplimiento), 3) materiales de piso, y
   // recién después los comentarios del cierre e incidentes/accidentes.
   if (area.resumenCompletoCierre) {
-    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoCierre(record, inicio, programaEntries) || {};
+    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoCierre(record, inicio, programaEntries, horarios) || {};
     if (dotacion.length > 0) {
       lineas.push("*Dotación:*");
       dotacion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
@@ -3763,18 +3763,91 @@ function LavadoCierre({ values, setField }) {
 // ---------------------------------------------------------------------------
 // SELECCIÓN
 // ---------------------------------------------------------------------------
-function MaterialesTable({ items, values, setField, prefix }) {
+function MaterialesTable({ items, values, setField, prefix, excludeIndices }) {
+  const excluir = excludeIndices || [];
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-      {items.map((label, i) => (
-        <NumField
-          key={i}
-          label={label}
-          unit={MATERIAL_UNIDAD[label]}
-          value={values[`${prefix}_${i}`]}
-          onChange={(v) => setField(`${prefix}_${i}`, v)}
-        />
-      ))}
+      {items.map((label, i) => {
+        if (excluir.includes(i)) return null;
+        return (
+          <NumField
+            key={i}
+            label={label}
+            unit={MATERIAL_UNIDAD[label]}
+            value={values[`${prefix}_${i}`]}
+            onChange={(v) => setField(`${prefix}_${i}`, v)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// Suma el campo "cantidad" a través de todas las filas de un desglose de MTC por SKU.
+function sumMtcSku(rows) {
+  return (rows || []).reduce((sum, r) => sum + (Number(r && r.cantidad) || 0), 0);
+}
+
+// Editor de "Cantidad MTC Cajas" o "Cantidad MTC Bolsas" desglosado por
+// SKU/MTC. Ojo: son dos MTC distintos e independientes — un MTC que es solo
+// de cajas y otro MTC que es solo de bolsas (no el mismo MTC con ambas
+// cantidades) — por eso este editor se usa dos veces por separado (una vez
+// para Cajas y otra para Bolsas), cada una con su propia lista de filas
+// (SKU/MTC + cantidad). En un turno se puede envasar más de un SKU, así que
+// se registra una fila por cada MTC programado. El total (suma de todas las
+// filas) se guarda además en el campo legacy `legacyField` para mantener
+// compatibilidad con el índice posicional de MATERIALES_ENVASADO (usado por
+// el histórico de stock, alertas y registros antiguos).
+function MtcPorSkuEditor({ title, unitLabel, skusProgramados, values, setField, fieldName, legacyField }) {
+  const rows = values[fieldName] || [];
+  const skusKey = (skusProgramados || []).join(",");
+
+  // Si aún no hay filas y hay SKU(s) programados para el turno, precarga
+  // una fila por cada uno para que el usuario solo tenga que ingresar la cantidad.
+  useEffect(() => {
+    if (rows.length === 0 && skusProgramados && skusProgramados.length > 0) {
+      setField(fieldName, skusProgramados.map((sku) => ({ sku, cantidad: "" })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusKey]);
+
+  // Mantiene sincronizado el total legacy con la suma de las filas.
+  const rowsKey = JSON.stringify(rows);
+  useEffect(() => {
+    setField(legacyField, sumMtcSku(rows) || "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowsKey]);
+
+  const updateRow = (i, key, val) => {
+    const next = rows.map((r, idx) => (idx === i ? { ...r, [key]: val } : r));
+    setField(fieldName, next);
+  };
+  const addRow = () => setField(fieldName, [...rows, { sku: "", cantidad: "" }]);
+  const removeRow = (i) => setField(fieldName, rows.filter((_, idx) => idx !== i));
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold text-slate-900">{title} por SKU</span>
+        <button type="button" onClick={addRow} className="text-xs text-emerald-700 font-medium hover:underline">
+          + Agregar SKU
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="text-xs text-slate-400 italic">Sin SKU registrados. Agrega uno manualmente o prográmalo en el turno.</p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((row, i) => (
+            <div key={i} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 items-end border border-slate-200 rounded-lg p-2">
+              <TextField label="MTC / SKU" value={row.sku} onChange={(v) => updateRow(i, "sku", v)} />
+              <NumField label={title} unit={unitLabel} value={row.cantidad} onChange={(v) => updateRow(i, "cantidad", v)} />
+              <button type="button" onClick={() => removeRow(i)} className="text-xs text-rose-600 hover:underline pb-2">
+                Quitar
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -4303,9 +4376,14 @@ function CodificacionCard({ sku }) {
 }
 
 function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
-  const mapping = MATERIALES_ENVASADO.map((_, i) => [`finMat_${i}`, `inicioMat_${i}`]);
+  const mapping = [
+    ...MATERIALES_ENVASADO.map((_, i) => [`finMat_${i}`, `inicioMat_${i}`]),
+    ["mtcCajasSkuFin", "mtcCajasSkuInicio"],
+    ["mtcBolsasSkuFin", "mtcBolsasSkuInicio"],
+  ];
   const { prevCierre, prev } = useCarryOver("envasado", values, setField, editingId, mapping);
   const { horarios } = useHorariosTurno();
+  const { getMat } = useSkuOverrides();
 
   const activaEnvasadora = values.activa_envasadora === "Sí";
   const activaLinea5 = values.activa_linea5 === "Sí";
@@ -4319,6 +4397,31 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
       .forEach((e) => set.add(e.especie));
     return [...set];
   }, [programaEntries, values.turno]);
+
+  // El MTC de caja y el MTC de bolsa de cada SKU programado ya están
+  // definidos en la especificación del SKU (maestro de materiales), así que
+  // no hace falta que el supervisor los tipee: se reconocen automáticamente
+  // a partir del Programa de producción de Envasadora de este turno. Si dos
+  // SKU programados comparten el mismo MTC, se deja una sola fila para ese MTC.
+  const mtcCajasProgramados = useMemo(() => {
+    const set = new Set();
+    skusProgramadosTurno.forEach((sku) => {
+      const mat = getMat(sku);
+      if (mat?.codCaja) set.add(mat.codCaja);
+    });
+    return [...set];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusProgramadosTurno.join(",")]);
+
+  const mtcBolsasProgramados = useMemo(() => {
+    const set = new Set();
+    skusProgramadosTurno.forEach((sku) => {
+      const mat = getMat(sku);
+      if (mat?.codBolsa) set.add(mat.codBolsa);
+    });
+    return [...set];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusProgramadosTurno.join(",")]);
 
   // Especie(s) programadas para Línea 5 en este turno.
   const especiesLinea5Prog = useMemo(() => {
@@ -4370,7 +4473,27 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
             Sin cierre de turno anterior registrado — se completó en 0. Ajusta si corresponde.
           </p>
         )}
-        <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="inicioMat" />
+        <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="inicioMat" excludeIndices={[3, 4]} />
+        <div className="mt-4 pt-4 border-t border-slate-200 space-y-4">
+          <MtcPorSkuEditor
+            title="Cantidad MTC Cajas"
+            unitLabel="cajas"
+            skusProgramados={mtcCajasProgramados}
+            values={values}
+            setField={setField}
+            fieldName="mtcCajasSkuInicio"
+            legacyField="inicioMat_3"
+          />
+          <MtcPorSkuEditor
+            title="Cantidad MTC Bolsas"
+            unitLabel="bolsas"
+            skusProgramados={mtcBolsasProgramados}
+            values={values}
+            setField={setField}
+            fieldName="mtcBolsasSkuInicio"
+            legacyField="inicioMat_4"
+          />
+        </div>
       </Card>
 
       <Card title="Dotación general" step={3}>
@@ -4482,17 +4605,88 @@ function computeEnvasadoMetrics(values) {
   const cumplimiento = num(values.cajasProgramadas) ? num(values.cajasProducidas) / num(values.cajasProgramadas) : 0;
   const mermaCajas = num(values.cajasTeoricas) ? (num(values.cajasConsumidasReal) - num(values.cajasTeoricas)) / num(values.cajasTeoricas) : 0;
   const mermaBolsas = num(values.bolsasTeoricas) ? (num(values.bolsasConsumidasReal) - num(values.bolsasTeoricas)) / num(values.bolsasTeoricas) : 0;
-  const rendimientoLinea5 = num(values.l5_kgIngresados) ? num(values.l5_kgAprobados) / num(values.l5_kgIngresados) : 0;
-  return { cumplimiento, mermaCajas, mermaBolsas, rendimientoLinea5 };
+  // Línea 5 ahora usa el mismo esquema que las líneas de Selección (Kg
+  // ingresados + hasta 3 tipos de "Kg aprobados"). Si el registro es antiguo
+  // y no tiene datos en ese esquema, cae de vuelta a los campos legacy
+  // l5_kgIngresados/l5_kgAprobados para no perder el histórico.
+  const l5Totales = lineaKgTotales(values, { key: "linea5" });
+  let l5Ing = l5Totales.ing;
+  let l5Apr = l5Totales.apr;
+  if (!l5Ing && !l5Apr) {
+    l5Ing = num(values.l5_kgIngresados);
+    l5Apr = num(values.l5_kgAprobados);
+  }
+  const rendimientoLinea5 = l5Ing ? l5Apr / l5Ing : 0;
+  return { cumplimiento, mermaCajas, mermaBolsas, rendimientoLinea5, l5Ing, l5Apr };
+}
+
+// Suma los minutos de todas las filas de detenciones registradas en el cierre.
+function sumDetenciones(rows) {
+  return (rows || []).reduce((s, r) => s + (Number(r && r.minutos) || 0), 0);
+}
+
+// Tiempo efectivo (T.E) y productividad (bolsas por minuto) del cierre de
+// Envasado, siguiendo el mismo criterio que "Horarios de Turno":
+//   T.E = minutos efectivos del turno (según horario configurado) − Σ minutos
+//         de las detenciones registradas en este cierre.
+//   Productividad (bpm) = Bolsas consumidas real / T.E.
+function computeTiempoEfectivoEnvasado(values, horarios) {
+  const horario = values.fecha && values.turno && horarios ? horarioParaTurno(values.fecha, values.turno, horarios) : null;
+  const minutosBase = horario ? horario.minutosEfectivos : 0;
+  const totalDetenciones = sumDetenciones(values.detenciones);
+  const tiempoEfectivo = horario ? Math.max(0, minutosBase - totalDetenciones) : null;
+  const productividad = tiempoEfectivo ? num(values.bolsasConsumidasReal) / tiempoEfectivo : 0;
+  return { horario, minutosBase, totalDetenciones, tiempoEfectivo, productividad };
+}
+
+// Editor de la lista de "Detenciones" del cierre de Envasado: motivo + minutos
+// por fila, usada para calcular el Tiempo Efectivo y la Productividad (bpm).
+function DetencionesEditor({ values, setField }) {
+  const rows = values.detenciones || [];
+  const updateRow = (i, key, val) => {
+    const next = rows.map((r, idx) => (idx === i ? { ...r, [key]: val } : r));
+    setField("detenciones", next);
+  };
+  const addRow = () => setField("detenciones", [...rows, { motivo: "", minutos: "" }]);
+  const removeRow = (i) => setField("detenciones", rows.filter((_, idx) => idx !== i));
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold text-slate-900">Detenciones</span>
+        <button type="button" onClick={addRow} className="text-xs text-emerald-700 font-medium hover:underline">
+          + Agregar detención
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="text-xs text-slate-400 italic">Sin detenciones registradas en este turno.</p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((row, i) => (
+            <div key={i} className="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2 items-end border border-slate-200 rounded-lg p-2">
+              <TextField label="Motivo" value={row.motivo} onChange={(v) => updateRow(i, "motivo", v)} />
+              <NumField label="Minutos" value={row.minutos} onChange={(v) => updateRow(i, "minutos", v)} />
+              <button type="button" onClick={() => removeRow(i)} className="text-xs text-rose-600 hover:underline pb-2">
+                Quitar
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
+  const { horarios } = useHorariosTurno();
+  const { getMat } = useSkuOverrides();
   const activaEnvasadora = (inicio?.activa_envasadora ?? values.activa_envasadora) === "Sí";
   const activaLinea5 = (inicio?.activa_linea5 ?? values.activa_linea5) === "Sí";
   const especieLinea5 = inicio?.linea5_especie || values.linea5_especie || "";
   let procesosLinea5 = LINEA_PROCESOS.LINEA_MANUAL.filter(([, especie]) => especie === especieLinea5).map((p) => p[0]);
   if (procesosLinea5.length === 0) procesosLinea5 = LINEA_PROCESOS.LINEA_MANUAL.map((p) => p[0]);
   const m = computeEnvasadoMetrics(values);
+  const te = computeTiempoEfectivoEnvasado(values, horarios);
   const cierreStep2 = activaLinea5 ? 2 : null;
   const cierreStep3 = activaEnvasadora ? (activaLinea5 ? 3 : 2) : null;
 
@@ -4512,6 +4706,46 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activaEnvasadora, skusProgramadosTurno.join(","), values.envasadora_sku]);
+
+  // El MTC de caja y el MTC de bolsa de cada SKU programado ya están
+  // definidos en la especificación del SKU (maestro de materiales) — se usan
+  // como respaldo si el Inicio de turno no llegó a registrar ninguno.
+  const mtcCajasProgramados = useMemo(() => {
+    const set = new Set();
+    skusProgramadosTurno.forEach((sku) => {
+      const mat = getMat(sku);
+      if (mat?.codCaja) set.add(mat.codCaja);
+    });
+    return [...set];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusProgramadosTurno.join(",")]);
+
+  const mtcBolsasProgramados = useMemo(() => {
+    const set = new Set();
+    skusProgramadosTurno.forEach((sku) => {
+      const mat = getMat(sku);
+      if (mat?.codBolsa) set.add(mat.codBolsa);
+    });
+    return [...set];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusProgramadosTurno.join(",")]);
+
+  // Los MTC de Cajas/Bolsas que ya se registraron en el Inicio de turno de
+  // ESTE mismo turno: el Cierre ya sabe qué MTC están asignados y parte con
+  // los mismos, sin que haya que volver a elegirlos. Solo si el Inicio no
+  // registró ninguno se recurre, como respaldo, a los MTC que la
+  // especificación del SKU define para lo programado en este turno.
+  const skusCajasIniciales = useMemo(() => {
+    const desdeInicio = (inicio?.mtcCajasSkuInicio || []).map((r) => r.sku).filter(Boolean);
+    return desdeInicio.length > 0 ? desdeInicio : mtcCajasProgramados;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inicio, mtcCajasProgramados.join(",")]);
+
+  const skusBolsasIniciales = useMemo(() => {
+    const desdeInicio = (inicio?.mtcBolsasSkuInicio || []).map((r) => r.sku).filter(Boolean);
+    return desdeInicio.length > 0 ? desdeInicio : mtcBolsasProgramados;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inicio, mtcBolsasProgramados.join(",")]);
 
   // Cajas programadas = lo que el Programa de producción indica para ESTE SKU en este turno.
   // (Si hay varios SKU programados en el mismo turno, cada cierre registra uno; cambiar el
@@ -4548,10 +4782,37 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activaEnvasadora, bolsasTeoricasCalc]);
 
+  // Kg programados para Línea 5 en este turno (mismo criterio que el
+  // Cumplimiento por línea de Selección) y el cumplimiento resultante.
+  const kgProgLinea5 = (programaEntries || [])
+    .filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO")
+    .reduce((s, p) => s + num(p.cantidad), 0);
+  const cumplimientoLinea5 = kgProgLinea5 ? m.l5Ing / kgProgLinea5 : 0;
+
   return (
     <div className="space-y-4">
       <Card title="Materiales piso planta (fin de turno)" step={1}>
-        <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="finMat" />
+        <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="finMat" excludeIndices={[3, 4]} />
+        <div className="mt-4 pt-4 border-t border-slate-200 space-y-4">
+          <MtcPorSkuEditor
+            title="Cantidad MTC Cajas"
+            unitLabel="cajas"
+            skusProgramados={skusCajasIniciales}
+            values={values}
+            setField={setField}
+            fieldName="mtcCajasSkuFin"
+            legacyField="finMat_3"
+          />
+          <MtcPorSkuEditor
+            title="Cantidad MTC Bolsas"
+            unitLabel="bolsas"
+            skusProgramados={skusBolsasIniciales}
+            values={values}
+            setField={setField}
+            fieldName="mtcBolsasSkuFin"
+            legacyField="finMat_4"
+          />
+        </div>
       </Card>
 
       {!activaEnvasadora && !activaLinea5 && (
@@ -4560,15 +4821,27 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
 
       {activaLinea5 && (
         <Card title="Cierre de proceso — Línea 5" step={cierreStep2}>
-          <p className="text-sm text-slate-700 mb-2">Especie: <span className="font-semibold text-slate-900">{especieLinea5 || "—"}</span></p>
           <div className="mb-3">
             <SelectField label="Proceso" value={values.l5_proceso} onChange={(v) => setField("l5_proceso", v)} options={procesosLinea5} />
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <NumField label="Kg ingresados" value={values.l5_kgIngresados} onChange={(v) => setField("l5_kgIngresados", v)} />
-            <NumField label="Kg aprobados" value={values.l5_kgAprobados} onChange={(v) => setField("l5_kgAprobados", v)} />
+          {/* Mismo formato que el cierre de las líneas de Selección: Kg ingresados,
+              hasta 3 tipos de Kg aprobados, total, rendimiento y cumplimiento. */}
+          <div className="border border-slate-200 bg-slate-50 rounded-lg p-2.5 space-y-2">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-700 font-medium">{especieLinea5 || "—"}</span>
+            </div>
+            <NumField label="Kg ingresados" value={values.kg_linea5_e1_ing} onChange={(v) => setField("kg_linea5_e1_ing", v)} />
+            <KgAprobadoRows lineaKey="linea5" slot={1} values={values} setField={setField} tipos={especieLinea5 ? [especieLinea5] : []} />
+            <p className="text-sm text-slate-700 pt-1 border-t border-slate-200">
+              Kg aprobados total: <span className="font-semibold">{fmtNum(m.l5Apr, 1)}</span> · Rendimiento: <span className="font-semibold">{fmtPct(m.rendimientoLinea5)}</span>
+            </p>
           </div>
-          <p className="text-sm text-slate-700 mt-2">Rendimiento: <span className="font-semibold">{fmtPct(m.rendimientoLinea5)}</span></p>
+          <p className="text-sm text-slate-700 mt-2">
+            Cumplimiento:{" "}
+            <span className="font-semibold">
+              {kgProgLinea5 ? `${fmtPct(cumplimientoLinea5)} (${fmtNum(m.l5Ing, 0)}/${fmtNum(kgProgLinea5, 0)} Kg)` : "Sin Kg programado"}
+            </span>
+          </p>
         </Card>
       )}
 
@@ -4616,6 +4889,24 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
               ["Merma cajas", fmtPct(m.mermaCajas)],
               ["Merma bolsas", fmtPct(m.mermaBolsas)],
             ]} />
+          </div>
+        </Card>
+      )}
+
+      {activaEnvasadora && (
+        <Card title="Tiempos y detenciones">
+          <DetencionesEditor values={values} setField={setField} />
+          <div className="mt-3">
+            {te.horario ? (
+              <DataGrid items={[
+                ["T.E", `${fmtNum(te.tiempoEfectivo)} min`],
+                ["Productividad", `${fmtNum(te.productividad, 2)} bpm`],
+              ]} />
+            ) : (
+              <p className="text-xs text-slate-400 italic">
+                Configura el horario de este turno (Horarios de Turno) para calcular el Tiempo Efectivo y la Productividad.
+              </p>
+            )}
           </div>
         </Card>
       )}
@@ -5814,6 +6105,14 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
         produccion.push([`${prefijo} · Kg aprobados total`, fmtNum(apr)]);
         produccion.push([`${prefijo} · Rendimiento`, fmtPct(rend)]);
       });
+      // Cumplimiento propio de esta línea (Kg ingresados de la línea / Kg
+      // programados para la línea) — además del cumplimiento global de arriba.
+      const kgProgLinea = (programaEntries || [])
+        .filter((p) => (p.lineaKey === l.key || p.linea === l.key) && p.especie !== "LAVADO")
+        .reduce((s, p) => s + num(p.cantidad), 0);
+      const kgIngLinea = lineaKgTotales(r, l).ing;
+      const cumplimientoLinea = kgProgLinea ? kgIngLinea / kgProgLinea : 0;
+      produccion.push([`${l.label} · Cumplimiento`, kgProgLinea ? `${fmtPct(cumplimientoLinea)} (${fmtNum(kgIngLinea, 0)}/${fmtNum(kgProgLinea, 0)} Kg)` : "Sin Kg programado"]);
     });
   }
 
@@ -5849,14 +6148,26 @@ function resumenEnvasadoInicioCompleto(r) {
 
   const materiales = [];
   MATERIALES_ENVASADO.forEach((nombre, i) => {
+    if (i === 3 || i === 4) return; // Cantidad MTC Cajas/Bolsas: se desglosan por SKU abajo.
     const v = num(r[`inicioMat_${i}`]);
     if (v > 0) materiales.push([`Material · ${nombre}`, v]);
   });
+  materiales.push(...materialesMtcSkuLines(r.mtcCajasSkuInicio, "Cajas"));
+  materiales.push(...materialesMtcSkuLines(r.mtcBolsasSkuInicio, "Bolsas"));
 
   return { dotacion, produccion, materiales };
 }
 
-function resumenEnvasadoCierreCompleto(r, inicio) {
+// Convierte el desglose de MTC por SKU (Cajas o Bolsas, por separado — son
+// MTC distintos e independientes) en líneas de mensaje, una por cada
+// SKU/MTC que tenga cantidad registrada.
+function materialesMtcSkuLines(rows, unitLabel) {
+  return (rows || [])
+    .filter((row) => num(row.cantidad) > 0)
+    .map((row) => [`Material · MTC ${unitLabel} ${row.sku || "—"}`, fmtNum(row.cantidad || 0)]);
+}
+
+function resumenEnvasadoCierreCompleto(r, inicio, programaEntries, horarios) {
   const src = inicio || r;
   const dotacion = [];
   DOTACION_GENERAL_ENVASADO.forEach((label, i) => {
@@ -5873,11 +6184,25 @@ function resumenEnvasadoCierreCompleto(r, inicio) {
   const activaEnvasadora = (inicio?.activa_envasadora ?? r.activa_envasadora) === "Sí";
   if (activaLinea5) {
     const m = computeEnvasadoMetrics(r);
+    // Mismo formato que el cierre de las líneas de Selección: Kg ingresados,
+    // desglose de "Aprobado (tipo)", Kg aprobados total, Rendimiento y Cumplimiento.
     produccion.push(["Línea 5 · Especie", inicio?.linea5_especie || r.linea5_especie || "—"]);
     produccion.push(["Línea 5 · Proceso", r.l5_proceso || "—"]);
-    produccion.push(["Línea 5 · Kg ingresados", fmtNum(r.l5_kgIngresados || 0)]);
-    produccion.push(["Línea 5 · Kg aprobados", fmtNum(r.l5_kgAprobados || 0)]);
+    produccion.push(["Línea 5 · Kg ingresados", fmtNum(m.l5Ing)]);
+    APROBADO_SLOTS.forEach((t) => {
+      const tipo = r[`kg_linea5_e1_apr_t${t}_tipo`];
+      const kg = r[`kg_linea5_e1_apr_t${t}_kg`];
+      if (tipo && kg !== undefined && kg !== "") {
+        produccion.push([`Línea 5 · Aprobado (${tipo})`, fmtNum(num(kg))]);
+      }
+    });
+    produccion.push(["Línea 5 · Kg aprobados total", fmtNum(m.l5Apr)]);
     produccion.push(["Línea 5 · Rendimiento", fmtPct(m.rendimientoLinea5)]);
+    const kgProgLinea5 = (programaEntries || [])
+      .filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO")
+      .reduce((s, p) => s + num(p.cantidad), 0);
+    const cumplimientoLinea5 = kgProgLinea5 ? m.l5Ing / kgProgLinea5 : 0;
+    produccion.push(["Línea 5 · Cumplimiento", kgProgLinea5 ? `${fmtPct(cumplimientoLinea5)} (${fmtNum(m.l5Ing, 0)}/${fmtNum(kgProgLinea5, 0)} Kg)` : "Sin Kg programado"]);
   }
   if (activaEnvasadora) {
     const m = computeEnvasadoMetrics(r);
@@ -5892,13 +6217,28 @@ function resumenEnvasadoCierreCompleto(r, inicio) {
     produccion.push(["Cumplimiento", fmtPct(m.cumplimiento)]);
     produccion.push(["Merma cajas", fmtPct(m.mermaCajas)]);
     produccion.push(["Merma bolsas", fmtPct(m.mermaBolsas)]);
+
+    // Detenciones + Tiempo Efectivo + Productividad (bolsas por minuto).
+    const te = computeTiempoEfectivoEnvasado(r, horarios);
+    const detenciones = (r.detenciones || []).filter((d) => (d.motivo && d.motivo.trim()) || num(d.minutos) > 0);
+    if (detenciones.length > 0) {
+      const detalle = detenciones.map((d) => `  · ${fmtNum(d.minutos || 0)} min ${d.motivo || "—"}`).join("\n");
+      produccion.push(["Detenciones", `\n${detalle}`]);
+    }
+    if (te.horario) {
+      produccion.push(["T.E", `${fmtNum(te.tiempoEfectivo)} min`]);
+      produccion.push(["Productividad", `${fmtNum(te.productividad, 2)} bpm`]);
+    }
   }
 
   const materiales = [];
   MATERIALES_ENVASADO.forEach((nombre, i) => {
+    if (i === 3 || i === 4) return; // Cantidad MTC Cajas/Bolsas: se desglosan por SKU abajo.
     const v = num(r[`finMat_${i}`]);
     if (v > 0) materiales.push([`Material · ${nombre}`, v]);
   });
+  materiales.push(...materialesMtcSkuLines(r.mtcCajasSkuFin, "Cajas"));
+  materiales.push(...materialesMtcSkuLines(r.mtcBolsasSkuFin, "Bolsas"));
 
   return { dotacion, produccion, materiales };
 }
@@ -6132,6 +6472,7 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
   const [inicioRecords, , loadingI] = useSharedList(`${area.key}-inicio-records`);
   const [cierreRecords, saveCierres, loadingC, storageError] = useSharedList(`${area.key}-cierre-records`);
   const [programas] = useSharedList("programa-records");
+  const { horarios } = useHorariosTurno();
   const [fecha, setFecha] = useState(today());
   const [turno, setTurno] = useState("");
   const [values, setValues] = useState({});
@@ -6229,7 +6570,7 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
             </button>
             {cierreActual?.estado === "Enviado" && (
               <a
-                href={whatsappShareUrl(buildResumenWhatsapp(area, cierreActual, inicio, programaEntries))}
+                href={whatsappShareUrl(buildResumenWhatsapp(area, cierreActual, inicio, programaEntries, horarios))}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="mt-3 w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 transition-colors"
