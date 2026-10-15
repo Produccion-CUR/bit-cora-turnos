@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
 import {
   Droplets, Filter, Package, ClipboardCheck, ClipboardList, BarChart3, Settings, X, Lock,
   Save, ArrowLeft, User, Loader2, CheckCircle2, AlertTriangle, Sun, Moon, Clock, Pencil,
   Trash2, LogOut, CalendarDays, Share2, Boxes, Plus, ChevronRight, BookOpen, ChevronDown,
-  Truck,
+  Truck, ChevronLeft, FileText, Printer,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
@@ -6385,7 +6386,9 @@ function InicioTab({ area, values, setField, editingId, onSaved, onCancelEdit, a
   const InicioComponent = area.InicioComponent;
 
   // Si el usuario entra a editar otro registro, ocultamos el botón de WhatsApp del guardado anterior.
-  useEffect(() => { setLastSaved(null); }, [editingId]);
+  // (Solo al ENTRAR a editar: al terminar de guardar una edición editingId vuelve a null y el
+  // botón de WhatsApp debe seguir visible.)
+  useEffect(() => { if (editingId) setLastSaved(null); }, [editingId]);
 
   const handleSave = async () => {
     if (!values.fecha || !values.turno) {
@@ -6404,9 +6407,11 @@ function InicioTab({ area, values, setField, editingId, onSaved, onCancelEdit, a
     };
     const updated = editingId ? records.map((r) => (r.id === editingId ? record : r)) : [...records, record];
     const ok = await saveRecords(updated);
+    // El registro ya quedó guardado en este dispositivo aunque falle la sincronización con
+    // Sheets, así que el botón de WhatsApp se ofrece igual.
+    setLastSaved(record);
     if (ok) {
       setToast({ kind: "ok", message: editingId ? "Cambios guardados." : "Registro de inicio guardado." });
-      setLastSaved(record);
       onSaved();
     } else {
       setToast({ kind: "error", message: "No se pudo sincronizar con el almacenamiento. Presiona Guardar nuevamente." });
@@ -6763,9 +6768,9 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
 
   const handleSaved = () => {
     if (editingId) {
+      // Se queda en "Inicio de turno" para que siga visible el botón de WhatsApp del guardado.
       setEditingId(null);
       setValues({ fecha: today(), turno: "" });
-      setTab("registros");
     } else {
       setValues((v) => ({ fecha: v.fecha, turno: "" }));
     }
@@ -6817,7 +6822,8 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard del Jefe de producción
+// Dashboard del Jefe de producción — vista EJECUTIVA + reporte semanal (PDF)
+// El reporte PDF reutiliza exactamente el mismo panel que la pantalla.
 // ---------------------------------------------------------------------------
 function useAreaCierres(areaKey) {
   const [inicio, , loadingI] = useSharedList(`${areaKey}-inicio-records`);
@@ -6825,29 +6831,657 @@ function useAreaCierres(areaKey) {
   return { inicio, cierres, loading: loadingI || loadingC };
 }
 
-function MiniChart({ area, inicio, cierres }) {
-  const ind = area.indicator;
-  const sorted = [...cierres].sort((a, b) => a.id - b.id).slice(-7);
-  const merged = sorted.map((c) => ({ ...(inicio.find((r) => r.claveTurno === c.claveTurno) || {}), ...c }));
-  const data = merged.map((r) => ({
-    label: `${fmtFecha(r.fecha)} ${r.turno}`,
-    value: ind.format === "pct" ? Number((ind.compute(r) * 100).toFixed(1)) : ind.compute(r),
+// ---- Fechas (en hora local, formato AAAA-MM-DD como el resto de la app) ----
+const parseIso = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d); };
+const isoDeFecha = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const sumarDias = (iso, n) => { const d = parseIso(iso); d.setDate(d.getDate() + n); return isoDeFecha(d); };
+// Semana de lunes a domingo que contiene la fecha dada.
+const semanaDe = (iso) => {
+  const dow = (parseIso(iso).getDay() + 6) % 7;
+  const desde = sumarDias(iso, -dow);
+  return { desde, hasta: sumarDias(desde, 6) };
+};
+const fmtCorto = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+const MESES_CORTOS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+const sumaPor = (arr, fn) => arr.reduce((s, x) => s + fn(x), 0);
+const cap1 = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// Serie día a día entre `desde` y `hasta`. Con `fnDen` entrega una razón
+// (num/den) por día; sin ella, la suma. `valor` es null en días sin datos.
+function serieDiaria(registros, desde, hasta, fnNum, fnDen) {
+  const out = [];
+  for (let f = desde; f <= hasta; f = sumarDias(f, 1)) {
+    const rs = registros.filter((r) => r.fecha === f);
+    let valor = null;
+    if (rs.length > 0) {
+      const n = sumaPor(rs, fnNum);
+      if (fnDen) { const d = sumaPor(rs, fnDen); valor = d ? n / d : null; }
+      else valor = n;
+    }
+    out.push({ fecha: f, label: fmtCorto(f), valor });
+  }
+  return out;
+}
+
+// Incidentes + accidentes por supervisor (responsable del cierre): por día en
+// el período, por semana (últimas 8) y por mes (últimos 6). Usa TODO el
+// historial, no solo el período seleccionado, para que las barras semanales y
+// mensuales sean comparables.
+function seguridadPorSupervisor(datos, desde, hasta) {
+  const casos = [];
+  [datos.lavado, datos.seleccion, datos.envasado].forEach((a) => a.cierres.forEach((c) => {
+    if (c.huboIncidentes !== "Sí" && c.huboAccidentes !== "Sí") return;
+    const sup = String(c.responsable || "").trim() || "Sin nombre";
+    const tipo = c.huboAccidentes === "Sí" ? "acc" : "inc";
+    incidentesDeCierre(c).forEach(() => casos.push({ fecha: c.fecha, sup, tipo }));
+  }));
+
+  const semanaFin = semanaDe(hasta);
+  const semanas = [];
+  for (let k = 7; k >= 0; k--) {
+    const w = semanaDe(sumarDias(semanaFin.desde, -7 * k));
+    semanas.push({ desde: w.desde, hasta: w.hasta, label: fmtCorto(w.desde) });
+  }
+  const [yH, mH] = hasta.split("-").map(Number);
+  const meses = [];
+  for (let k = 5; k >= 0; k--) {
+    const d = new Date(yH, mH - 1 - k, 1);
+    meses.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`, label: `${MESES_CORTOS[d.getMonth()]} ${String(d.getFullYear()).slice(2)}` });
+  }
+  const mesActual = meses[meses.length - 1].key;
+
+  const enPeriodo = casos.filter((c) => c.fecha >= desde && c.fecha <= hasta);
+  const enSemanas = casos.filter((c) => c.fecha >= semanas[0].desde && c.fecha <= semanas[semanas.length - 1].hasta);
+  const enMeses = casos.filter((c) => meses.some((m) => c.fecha.startsWith(m.key)));
+  const nombres = [...new Set([...enPeriodo, ...enSemanas, ...enMeses].map((c) => c.sup))];
+  const total = (s) => casos.filter((c) => c.sup === s && (
+    (c.fecha >= desde && c.fecha <= hasta) || (c.fecha >= semanas[0].desde && c.fecha <= semanas[7].hasta) || c.fecha.startsWith(mesActual)
+  )).length;
+  const supervisores = nombres.sort((a, b) => total(b) - total(a) || a.localeCompare(b));
+  const colores = {};
+  supervisores.forEach((s, i) => { colores[s] = SERIES_COLORS[i % SERIES_COLORS.length]; });
+
+  const fila = (label, lista) => {
+    const o = { label };
+    supervisores.forEach((s) => { o[s] = lista.filter((c) => c.sup === s).length; });
+    return o;
+  };
+  const porDia = [];
+  for (let f = desde; f <= hasta; f = sumarDias(f, 1)) porDia.push(fila(fmtCorto(f), enPeriodo.filter((c) => c.fecha === f)));
+  const porSemana = semanas.map((w) => fila(w.label, casos.filter((c) => c.fecha >= w.desde && c.fecha <= w.hasta)));
+  const porMes = meses.map((m) => fila(m.label, casos.filter((c) => c.fecha.startsWith(m.key))));
+
+  const tabla = supervisores.map((s) => {
+    const cuenta = (lista, tipo) => lista.filter((c) => c.sup === s && c.tipo === tipo).length;
+    const delMes = casos.filter((c) => c.fecha.startsWith(mesActual));
+    return {
+      sup: s,
+      perInc: cuenta(enPeriodo, "inc"), perAcc: cuenta(enPeriodo, "acc"),
+      mesInc: cuenta(delMes, "inc"), mesAcc: cuenta(delMes, "acc"),
+    };
+  });
+
+  return {
+    supervisores, colores, porDia, porSemana, porMes, tabla,
+    hayDia: porDia.some((r) => supervisores.some((s) => r[s] > 0)),
+    haySemana: porSemana.some((r) => supervisores.some((s) => r[s] > 0)),
+    hayMes: porMes.some((r) => supervisores.some((s) => r[s] > 0)),
+    mesLabel: meses[meses.length - 1].label,
+  };
+}
+
+// Calcula TODOS los indicadores de un período (cierres con su inicio fusionado).
+function resumenPeriodo(datos, desde, hasta) {
+  const { lavado, seleccion, envasado, programas, horarios } = datos;
+  const enRango = (r) => r.fecha && r.fecha >= desde && r.fecha <= hasta;
+  const fusionados = (a) => a.cierres.filter(enRango).map((c) => ({ ...(a.inicio.find((i) => i.claveTurno === c.claveTurno) || {}), ...c }));
+  const progDe = (c) => programas.filter((p) => p.fecha === c.fecha && p.turno === c.turno);
+  const hoy = today();
+  const sinCierre = (a) => a.inicio.filter((i) => enRango(i) && i.fecha < hoy && !a.cierres.some((c) => c.claveTurno === i.claveTurno)).length;
+
+  // ---- Lavado ----
+  const lav = fusionados(lavado);
+  const lavTotal = sumaPor(lav, (r) => totalPalletsFromPrefix(r, "lavados"));
+  const lavTipos = TIPOS_BANDEJA
+    .map((t) => ({ key: t.key, label: t.label.replace(/\s*\(.*\)/, ""), valor: sumaPor(lav, (r) => palletsValue(r, "lavados", t)) }))
+    .filter((t) => t.valor > 0);
+  const lavDiario = serieDiaria(lav, desde, hasta, (r) => totalPalletsFromPrefix(r, "lavados"));
+
+  // ---- Selección (total y por línea) ----
+  const sel = fusionados(seleccion);
+  const totSel = (r) => LINEAS_SELECCION.reduce((a, l) => {
+    if (r[`linea_${l.key}_activa`] === "Sí") { const t = lineaKgTotales(r, l); a.ing += t.ing; a.apr += t.apr; }
+    return a;
+  }, { ing: 0, apr: 0 });
+  const selLineas = LINEAS_SELECCION.map((l) => ({ key: l.key, label: l.label, ing: 0, apr: 0, ingCump: 0, prog: 0 }));
+  let selIngCump = 0, selProg = 0;
+  sel.forEach((c) => {
+    const prog = progDe(c);
+    const cu = computeSeleccionCumplimiento(c, c, prog);
+    if (cu.kgProgramado > 0) { selIngCump += cu.kgIngresado; selProg += cu.kgProgramado; }
+    LINEAS_SELECCION.forEach((l, i) => {
+      if (c[`linea_${l.key}_activa`] !== "Sí") return;
+      const t = lineaKgTotales(c, l);
+      selLineas[i].ing += t.ing;
+      selLineas[i].apr += t.apr;
+      const kp = sumaPor(prog.filter((p) => (p.lineaKey || p.linea) === l.key && p.especie !== "LAVADO"), (p) => num(p.cantidad));
+      if (kp > 0) { selLineas[i].ingCump += t.ing; selLineas[i].prog += kp; }
+    });
+  });
+  selLineas.forEach((ln, i) => {
+    const L = LINEAS_SELECCION[i];
+    const act = sel.filter((c) => c[`linea_${L.key}_activa`] === "Sí");
+    ln.rend = ln.ing ? ln.apr / ln.ing : null;
+    ln.cump = ln.prog ? ln.ingCump / ln.prog : null;
+    ln.diarioIng = serieDiaria(act, desde, hasta, (r) => lineaKgTotales(r, L).ing);
+    ln.diarioRend = serieDiaria(act, desde, hasta, (r) => lineaKgTotales(r, L).apr, (r) => lineaKgTotales(r, L).ing);
+  });
+  const selIng = sumaPor(selLineas, (l) => l.ing);
+  const selApr = sumaPor(selLineas, (l) => l.apr);
+  const selRend = selIng ? selApr / selIng : null;
+  const selCump = selProg ? selIngCump / selProg : null;
+
+  // ---- Envasado (Envasadora y Línea 5) ----
+  const env = fusionados(envasado);
+  let cajasProd = 0, cajasProg = 0, cajasTeor = 0, cajasReal = 0, bolsasTeor = 0, bolsasReal = 0;
+  let teTotal = 0, bolsasConTE = 0, l5Ing = 0, l5Apr = 0, l5IngCump = 0, l5Prog = 0, detTotal = 0;
+  const detMap = {};
+  env.forEach((c) => {
+    (c.detenciones || []).forEach((d) => {
+      const m = Number(d && d.minutos) || 0;
+      if (!m) return;
+      const motivo = cap1(String((d && d.motivo) || "").trim().toLowerCase()) || "Sin motivo";
+      detMap[motivo] = (detMap[motivo] || 0) + m;
+      detTotal += m;
+    });
+    if (c.activa_envasadora === "Sí") {
+      cajasProd += num(c.cajasProducidas); cajasProg += num(c.cajasProgramadas);
+      cajasTeor += num(c.cajasTeoricas); cajasReal += num(c.cajasConsumidasReal);
+      bolsasTeor += num(c.bolsasTeoricas); bolsasReal += num(c.bolsasConsumidasReal);
+      const te = computeTiempoEfectivoEnvasado(c, horarios);
+      if (te.tiempoEfectivo) { teTotal += te.tiempoEfectivo; bolsasConTE += num(c.bolsasConsumidasReal); }
+    }
+    if (c.activa_linea5 === "Sí") {
+      const m = computeEnvasadoMetrics(c);
+      l5Ing += m.l5Ing; l5Apr += m.l5Apr;
+      const kp = sumaPor(progDe(c).filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO"), (p) => num(p.cantidad));
+      if (kp > 0) { l5IngCump += m.l5Ing; l5Prog += kp; }
+    }
+  });
+  const detPareto = Object.entries(detMap).map(([motivo, min]) => ({ motivo, min })).sort((a, b) => b.min - a.min);
+  const envasadoraActiva = env.filter((c) => c.activa_envasadora === "Sí");
+  const l5Recs = env.filter((c) => c.activa_linea5 === "Sí");
+
+  // ---- Seguridad y operación ----
+  const todos = [
+    ...lav.map((c) => ({ ...c, area: "Lavado de bandejas" })),
+    ...sel.map((c) => ({ ...c, area: "Selección" })),
+    ...env.map((c) => ({ ...c, area: "Envasado" })),
+  ];
+  const incidentes = todos.filter((c) => c.huboIncidentes === "Sí").length;
+  const accidentes = todos.filter((c) => c.huboAccidentes === "Sí").length;
+  const eventos = todos
+    .filter((c) => c.huboIncidentes === "Sí" || c.huboAccidentes === "Sí")
+    .sort((a, b) => new Date(b.fechaHoraCierre || 0) - new Date(a.fechaHoraCierre || 0))
+    .flatMap((c) => incidentesDeCierre(c).map((it, i) => ({ ...c, ...it, itemIdx: i })));
+  const docsPendientes = eventos.filter((e) => (e.docHecha || "No") !== "Sí" || (e.docEntregada || "No") !== "Sí").length;
+  const turnosSinCierre = { lavado: sinCierre(lavado), seleccion: sinCierre(seleccion), envasado: sinCierre(envasado) };
+
+  const comentarios = todos
+    .flatMap((c) => ["Producción", "Calidad", "Mantención", "Seguridad"].map((t) => ({
+      area: c.area, fecha: c.fecha, turno: c.turno, tema: t, texto: String(c[`com_${t}`] || "").trim(),
+    })))
+    .filter((x) => x.texto)
+    .sort((a, b) => `${b.fecha}${b.turno}`.localeCompare(`${a.fecha}${a.turno}`));
+
+  return {
+    desde, hasta,
+    turnosCerrados: { lavado: lav.length, seleccion: sel.length, envasado: env.length },
+    lavado: { total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario },
+    seleccion: {
+      ing: selIng, apr: selApr, prog: selProg, rend: selRend, cump: selCump, lineas: selLineas,
+    },
+    envasado: {
+      cajasProd, cajasProg,
+      cump: cajasProg ? cajasProd / cajasProg : null,
+      mermaCajas: cajasTeor ? (cajasReal - cajasTeor) / cajasTeor : null,
+      mermaBolsas: bolsasTeor ? (bolsasReal - bolsasTeor) / bolsasTeor : null,
+      tiempoEfectivo: teTotal || null,
+      productividad: teTotal ? bolsasConTE / teTotal : null,
+      detTotal, detPareto,
+      diarioCump: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.cajasProducidas), (r) => num(r.cajasProgramadas)),
+      diarioCajas: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.cajasProducidas)),
+      l5Ing, l5Apr, l5Prog,
+      l5Rend: l5Ing ? l5Apr / l5Ing : null,
+      l5Cump: l5Prog ? l5IngCump / l5Prog : null,
+      l5DiarioIng: serieDiaria(l5Recs, desde, hasta, (r) => computeEnvasadoMetrics(r).l5Ing),
+      l5DiarioRend: serieDiaria(l5Recs, desde, hasta, (r) => computeEnvasadoMetrics(r).l5Apr, (r) => computeEnvasadoMetrics(r).l5Ing),
+    },
+    seguridad: { incidentes, accidentes, docsPendientes, eventos, supervisores: seguridadPorSupervisor(datos, desde, hasta) },
+    turnosSinCierreTotal: turnosSinCierre.lavado + turnosSinCierre.seleccion + turnosSinCierre.envasado,
+    turnosSinCierre,
+    comentarios,
+  };
+}
+
+// Variación entre período actual y anterior. pct → puntos porcentuales; num → %.
+function variacion(actual, previo, tipo) {
+  if (actual == null || previo == null) return null;
+  if (tipo === "pct") {
+    const d = (actual - previo) * 100;
+    if (Math.abs(d) < 0.05) return { txt: "=", signo: 0 };
+    return { txt: `${d > 0 ? "+" : ""}${fmtNum(d, 1)} pp`, signo: d > 0 ? 1 : -1 };
+  }
+  if (!previo) return actual ? { txt: "nuevo", signo: 1 } : { txt: "=", signo: 0 };
+  const d = ((actual - previo) / Math.abs(previo)) * 100;
+  if (Math.abs(d) < 0.5) return { txt: "=", signo: 0 };
+  return { txt: `${d > 0 ? "+" : ""}${fmtNum(d, 0)}%`, signo: d > 0 ? 1 : -1 };
+}
+
+function fmtValor(v, tipo) {
+  if (v == null) return "—";
+  if (tipo === "pct") return fmtPct(v);
+  if (tipo === "num1") return fmtNum(v, 1);
+  return fmtNum(v, 0);
+}
+
+// Verde ≥95 %, ámbar ≥85 %, rojo por debajo (solo para cumplimiento vs programa).
+function tonoCumplimiento(v) {
+  if (v == null) return undefined;
+  return v >= 0.95 ? "ok" : v >= 0.85 ? "warn" : "bad";
+}
+
+const TONO_CLASES = {
+  ok: "border-emerald-300 bg-emerald-50",
+  warn: "border-amber-300 bg-amber-50",
+  bad: "border-red-300 bg-red-50",
+  none: "border-slate-200 bg-white",
+};
+
+function DeltaChip({ actual, previo, tipo, menorEsMejor }) {
+  const v = variacion(actual, previo, tipo);
+  if (!v) return null;
+  const bueno = v.signo === 0 ? null : menorEsMejor ? v.signo < 0 : v.signo > 0;
+  const color = bueno === null ? "text-slate-500" : bueno ? "text-emerald-700" : "text-red-600";
+  const flecha = v.signo === 0 ? "" : v.signo > 0 ? "▲ " : "▼ ";
+  return <span className={`text-[11px] font-medium ${color}`}>{flecha}{v.txt} <span className="text-slate-400 font-normal">vs. anterior</span></span>;
+}
+
+function Kpi({ label, valor, tipo = "num", unidad = "", sub, actual, previo, menorEsMejor, tono, grande }) {
+  return (
+    <div className={`rounded-xl border px-3 py-2.5 ${TONO_CLASES[tono || "none"]}`}>
+      <div className="text-[11px] font-medium text-slate-500 leading-tight">{label}</div>
+      <div className={`${grande ? "text-3xl" : "text-xl"} font-bold text-slate-900 mt-0.5`}>
+        {fmtValor(valor, tipo)}{valor != null && unidad ? <span className="text-xs font-medium text-slate-500 ml-1">{unidad}</span> : null}
+      </div>
+      {sub && <div className="text-[11px] text-slate-500">{sub}</div>}
+      {actual !== undefined && <div><DeltaChip actual={actual} previo={previo} tipo={tipo === "pct" ? "pct" : "num"} menorEsMejor={menorEsMejor} /></div>}
+    </div>
+  );
+}
+
+// ---- Gráficos SVG (se escalan solos; usados en el reporte PDF y en seguridad) ----
+function SvgBarras({ data, formato = "num", color = "#3b82f6", alto = 100, ancho = 560 }) {
+  const W = ancho;
+  const vals = data.map((d) => d.valor).filter((v) => v != null);
+  if (vals.length === 0) return <div className="text-[11px] text-slate-400 italic py-2">Sin datos en el período.</div>;
+  const max = Math.max(Math.max(...vals) * 1.15, formato === "pct" ? 1 : 0.0001);
+  const n = data.length;
+  const bw = W / n;
+  const fmtV = (v) => (formato === "pct" ? `${fmtNum(v * 100, 0)}%` : fmtNum(v, 0));
+  return (
+    <svg viewBox={`0 0 ${W} ${alto + 26}`} className="w-full" role="img">
+      <line x1="0" y1={alto} x2={W} y2={alto} stroke="#cbd5e1" strokeWidth="1" />
+      {data.map((d, i) => {
+        const h = d.valor == null ? 0 : (d.valor / max) * (alto - 14);
+        const x = i * bw + bw * 0.18;
+        return (
+          <g key={d.fecha}>
+            {d.valor != null && <rect x={x} y={alto - h} width={bw * 0.64} height={Math.max(h, 1)} fill={color} rx="2" />}
+            {d.valor != null && n <= 14 && <text x={i * bw + bw / 2} y={alto - h - 3} textAnchor="middle" fontSize="9" fill="#334155">{fmtV(d.valor)}</text>}
+            {(n <= 14 || i % 2 === 0) && <text x={i * bw + bw / 2} y={alto + 12} textAnchor="middle" fontSize="9" fill="#64748b">{d.label}</text>}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// Barras apiladas por supervisor (una pila por día / semana / mes).
+function SvgApilado({ data, keys, colores, alto = 110 }) {
+  const W = 560;
+  const totales = data.map((d) => keys.reduce((s, k) => s + (d[k] || 0), 0));
+  const max = Math.max(...totales, 1) * 1.2;
+  const n = data.length;
+  const bw = W / n;
+  return (
+    <svg viewBox={`0 0 ${W} ${alto + 26}`} className="w-full" role="img">
+      <line x1="0" y1={alto} x2={W} y2={alto} stroke="#cbd5e1" strokeWidth="1" />
+      {data.map((d, i) => {
+        let acc = 0;
+        const x = i * bw + bw * 0.18;
+        return (
+          <g key={`${d.label}-${i}`}>
+            {keys.map((k) => {
+              const v = d[k] || 0;
+              if (!v) return null;
+              const h = (v / max) * (alto - 14);
+              const y = alto - acc - h;
+              acc += h;
+              return <rect key={k} x={x} y={y} width={bw * 0.64} height={h} fill={colores[k]} />;
+            })}
+            {totales[i] > 0 && <text x={i * bw + bw / 2} y={alto - acc - 3} textAnchor="middle" fontSize="9" fontWeight="600" fill="#334155">{totales[i]}</text>}
+            {(n <= 14 || i % 2 === 0) && <text x={i * bw + bw / 2} y={alto + 12} textAnchor="middle" fontSize="9" fill="#64748b">{d.label}</text>}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function LeyendaSupervisores({ keys, colores }) {
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1">
+      {keys.map((k) => (
+        <span key={k} className="flex items-center gap-1 text-[11px] text-slate-600">
+          <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: colores[k] }} />{k}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function GraficoApilado({ titulo, data, keys, colores, hay }) {
+  return (
+    <div className="rep-bloque">
+      <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+      {!hay ? <EmptyNote text="Sin incidentes ni accidentes en este rango." /> : (
+        <>
+          <SvgApilado data={data} keys={keys} colores={colores} />
+          <LeyendaSupervisores keys={keys} colores={colores} />
+        </>
+      )}
+    </div>
+  );
+}
+
+// Gráfico de barras diario: recharts en pantalla, SVG en el reporte PDF.
+function GraficoDiario({ titulo, data, formato = "num", color, svg, mitad }) {
+  const hay = data.some((x) => x.valor != null);
+  if (svg) {
+    return (
+      <div className="rep-bloque">
+        <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+        {hay ? <SvgBarras data={data} formato={formato} color={color} ancho={mitad ? 300 : 560} /> : <div className="text-[11px] text-slate-400 italic py-2">Sin datos en el período.</div>}
+      </div>
+    );
+  }
+  const d = data.map((x) => ({
+    label: x.label,
+    valor: x.valor == null ? null : formato === "pct" ? Number((x.valor * 100).toFixed(1)) : Number(x.valor.toFixed(1)),
   }));
   return (
-    <Card title={area.title}>
-      <p className="text-xs text-slate-600 mb-2">{ind.label}</p>
-      {data.length === 0 ? <EmptyNote text="Sin cierres registrados." /> : (
-        <ResponsiveContainer width="100%" height={160}>
-          <BarChart data={data} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+    <div>
+      <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+      {!hay ? <EmptyNote text="Sin datos en el período." /> : (
+        <ResponsiveContainer width="100%" height={150}>
+          <BarChart data={d} margin={{ top: 6, right: 6, left: -18, bottom: 0 }}>
             <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="label" stroke="#64748b" fontSize={9} />
-            <YAxis stroke="#64748b" fontSize={10} unit={ind.format === "pct" ? "%" : ""} />
+            <XAxis dataKey="label" stroke="#64748b" fontSize={9} interval="preserveStartEnd" minTickGap={14} />
+            <YAxis stroke="#64748b" fontSize={10} unit={formato === "pct" ? "%" : ""} />
             <Tooltip contentStyle={{ background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12, color: "#1e293b" }} />
-            <Bar dataKey="value" fill={ACCENT[area.accent].chart} radius={[4, 4, 0, 0]} />
+            <Bar dataKey="valor" name={titulo} fill={color} radius={[3, 3, 0, 0]} />
           </BarChart>
         </ResponsiveContainer>
       )}
-    </Card>
+    </div>
+  );
+}
+
+function ParetoDetenciones({ items, total }) {
+  if (!items.length) return <EmptyNote text="Sin detenciones registradas en el período." />;
+  const max = items[0].min;
+  return (
+    <div className="space-y-2">
+      {items.slice(0, 8).map((it) => (
+        <div key={it.motivo}>
+          <div className="flex justify-between text-xs text-slate-700">
+            <span className="truncate pr-2">{it.motivo}</span>
+            <span className="shrink-0 font-medium">{fmtNum(it.min)} min · {fmtPct(total ? it.min / total : 0)}</span>
+          </div>
+          <div className="h-2 rounded bg-slate-100">
+            <div className="h-2 rounded" style={{ width: `${(it.min / max) * 100}%`, background: "#f59e0b" }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SeccionArea({ titulo, color, children, salto }) {
+  return (
+    <div className={`${salto ? "rep-salto " : ""}rounded-2xl border border-slate-200 bg-white overflow-hidden`}>
+      <div className="px-4 py-2.5 text-sm font-bold text-white" style={{ background: color }}>{titulo}</div>
+      <div className="p-3 space-y-4">{children}</div>
+    </div>
+  );
+}
+
+// Bloque interior de una sección (una línea de Selección, Envasadora, Línea 5…).
+function SubBloque({ titulo, color, children }) {
+  return (
+    <div className="rep-bloque rounded-xl border border-slate-200 p-3 space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="inline-block w-1.5 h-4 rounded-sm" style={{ background: color }} />
+        <p className="text-sm font-bold text-slate-900">{titulo}</p>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SelectorPeriodo({ modo, setModo, offset, setOffset, desde, hasta }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-3 flex flex-wrap items-center gap-3 justify-between">
+      <div className="flex items-center gap-1">
+        <button onClick={() => setOffset(offset - 1)} aria-label="Semana anterior" className="p-2 rounded-lg hover:bg-slate-100 text-slate-700"><ChevronLeft size={18} /></button>
+        <div className="text-center min-w-[170px]">
+          <div className="text-sm font-semibold text-slate-900">{fmtFecha(desde)} – {fmtFecha(hasta)}</div>
+          <div className="text-[11px] text-slate-500">{offset === 0 ? "Semana actual" : offset === -1 ? "Semana pasada" : `Hace ${-offset} semanas`}{modo === "mes" ? " · 4 semanas" : ""}</div>
+        </div>
+        <button onClick={() => setOffset(Math.min(0, offset + 1))} disabled={offset >= 0} aria-label="Semana siguiente" className="p-2 rounded-lg hover:bg-slate-100 text-slate-700 disabled:opacity-30"><ChevronRight size={18} /></button>
+      </div>
+      <div className="flex rounded-lg border border-slate-300 overflow-hidden text-sm">
+        {[["semana", "Semana"], ["mes", "4 semanas"]].map(([k, l]) => (
+          <button key={k} onClick={() => setModo(k)} className={`px-3 py-1.5 ${modo === k ? "bg-slate-800 text-white" : "bg-white text-slate-700"}`}>{l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ListaEventos({ eventos }) {
+  if (eventos.length === 0) return <EmptyNote text="Sin incidentes ni accidentes en el período." />;
+  return (
+    <div className="space-y-2">
+      {eventos.map((c) => {
+        const tipos = [c.huboAccidentes === "Sí" ? "Accidente" : null, c.huboIncidentes === "Sí" ? "Incidente" : null].filter(Boolean).join(" + ");
+        const docHecha = c.docHecha || "No";
+        const docEntregada = c.docEntregada || "No";
+        const pendiente = docHecha !== "Sí" || docEntregada !== "Sí";
+        return (
+          <div key={`${c.area}-${c.id}-${c.itemIdx}`} className={`rep-bloque rounded-xl px-3 py-2.5 border ${pendiente ? "bg-red-50 border-red-200" : "bg-emerald-50 border-emerald-200"}`}>
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-sm font-semibold text-slate-900">{tipos} · {c.area}</span>
+              <span className="text-xs text-slate-600 shrink-0">{fmtFecha(c.fecha)} · {turnoLabel(c.turno)}</span>
+            </div>
+            <div className="text-xs text-slate-600 mt-1">Supervisor responsable: <b>{c.responsable || "—"}</b></div>
+            <div className="text-xs text-slate-600">Persona involucrada: <b>{c.nombre || "—"}</b></div>
+            {c.descripcion && <div className="text-xs text-slate-600 mt-1">"{c.descripcion}"</div>}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs">
+              <span className={docHecha === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>{docHecha === "Sí" ? "✓" : "⚠"} Documentación hecha: {docHecha}</span>
+              <span className={docEntregada === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>{docEntregada === "Sí" ? "✓" : "⚠"} Documentación entregada: {docEntregada}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Panel de indicadores: es lo que se ve en la pantalla Y lo que va en el PDF.
+// `svg` = true en el reporte (gráficos que se escalan al ancho de la hoja).
+function PanelIndicadores({ r, p, svg }) {
+  const cerrados = r.turnosCerrados.lavado + r.turnosCerrados.seleccion + r.turnosCerrados.envasado;
+  const lineasSel = r.seleccion.lineas
+    .map((l, i) => ({ l, prev: p.seleccion.lineas[i] }))
+    .filter(({ l }) => l.ing > 0 || l.apr > 0 || l.prog > 0);
+  const sg = r.seguridad.supervisores;
+
+  return (
+    <div className="space-y-4">
+      {/* ---------- Resumen ejecutivo ---------- */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <Kpi grande label="Pallets lavados" valor={r.lavado.total} actual={r.lavado.total} previo={p.lavado.total} sub={`${cerrados} turnos cerrados`} />
+        <Kpi grande label="Rendimiento Selección" tipo="pct" valor={r.seleccion.rend} actual={r.seleccion.rend} previo={p.seleccion.rend} sub={`${fmtNum(r.seleccion.ing)} Kg ingresados`} />
+        <Kpi grande label="Cumplimiento Envasadora" tipo="pct" valor={r.envasado.cump} tono={tonoCumplimiento(r.envasado.cump)} actual={r.envasado.cump} previo={p.envasado.cump} sub={`${fmtNum(r.envasado.cajasProd)} / ${fmtNum(r.envasado.cajasProg)} cajas`} />
+        <Kpi grande label="Incidentes / accidentes" valor={r.seguridad.incidentes + r.seguridad.accidentes} tono={r.seguridad.accidentes > 0 ? "bad" : r.seguridad.incidentes > 0 ? "warn" : "ok"} sub={`${r.seguridad.incidentes} incidentes · ${r.seguridad.accidentes} accidentes`} actual={r.seguridad.incidentes + r.seguridad.accidentes} previo={p.seguridad.incidentes + p.seguridad.accidentes} menorEsMejor />
+      </div>
+
+      {r.turnosSinCierreTotal > 0 && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+          <span>
+            {r.turnosSinCierreTotal} turno{r.turnosSinCierreTotal > 1 ? "s" : ""} con inicio registrado y <b>sin cierre</b>
+            {" "}(Lavado {r.turnosSinCierre.lavado} · Selección {r.turnosSinCierre.seleccion} · Envasado {r.turnosSinCierre.envasado}).
+          </span>
+        </div>
+      )}
+
+      {/* ---------- Lavado ---------- */}
+      <SeccionArea titulo="Lavado de bandejas" color="#2563eb">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Kpi label="Pallets lavados" valor={r.lavado.total} actual={r.lavado.total} previo={p.lavado.total} />
+          <Kpi label="Promedio por turno" tipo="num1" valor={r.lavado.promedio} actual={r.lavado.promedio} previo={p.lavado.promedio} />
+          <Kpi label="Turnos cerrados" valor={r.turnosCerrados.lavado} actual={r.turnosCerrados.lavado} previo={p.turnosCerrados.lavado} />
+          {r.lavado.tipos.map((t) => <Kpi key={t.key} label={t.label} tipo="num1" valor={t.valor} sub="pallets" />)}
+        </div>
+        <GraficoDiario svg={svg} titulo="Pallets lavados por día" data={r.lavado.diario} color="#3b82f6" />
+      </SeccionArea>
+
+      {/* ---------- Selección: total y una sección por línea ---------- */}
+      <SeccionArea titulo="Selección" color="#7c3aed" salto>
+        <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Total Selección</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Kpi label="Kg ingresados" valor={r.seleccion.ing} actual={r.seleccion.ing} previo={p.seleccion.ing} />
+          <Kpi label="Kg aprobados" valor={r.seleccion.apr} actual={r.seleccion.apr} previo={p.seleccion.apr} />
+          <Kpi label="Rendimiento" tipo="pct" valor={r.seleccion.rend} actual={r.seleccion.rend} previo={p.seleccion.rend} />
+          <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={r.seleccion.cump} tono={tonoCumplimiento(r.seleccion.cump)} actual={r.seleccion.cump} previo={p.seleccion.cump} sub={r.seleccion.prog ? `${fmtNum(r.seleccion.prog)} Kg programados` : "Sin Kg programado"} />
+        </div>
+        {lineasSel.length === 0 && <EmptyNote text="Sin cierres de Selección en el período." />}
+        {lineasSel.map(({ l, prev }, i) => (
+          <SubBloque key={l.key} titulo={l.label} color={SERIES_COLORS[i % SERIES_COLORS.length]}>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <Kpi label="Kg ingresados" valor={l.ing} actual={l.ing} previo={prev.ing} />
+              <Kpi label="Kg aprobados" valor={l.apr} actual={l.apr} previo={prev.apr} />
+              <Kpi label="Rendimiento" tipo="pct" valor={l.rend} actual={l.rend} previo={prev.rend} />
+              <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={l.cump} tono={tonoCumplimiento(l.cump)} actual={l.cump} previo={prev.cump} sub={l.prog ? `${fmtNum(l.prog)} Kg programados` : "Sin Kg programado"} />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <GraficoDiario svg={svg} titulo="Kg ingresados por día" data={l.diarioIng} mitad color="#a78bfa" />
+              <GraficoDiario svg={svg} titulo="Rendimiento por día" data={l.diarioRend} mitad formato="pct" color="#7c3aed" />
+            </div>
+          </SubBloque>
+        ))}
+      </SeccionArea>
+
+      {/* ---------- Envasado: Envasadora y Línea 5 por separado ---------- */}
+      <SeccionArea titulo="Envasado" color="#059669" salto>
+        <SubBloque titulo="Envasadora" color="#10b981">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <Kpi label="Cajas producidas" valor={r.envasado.cajasProd} actual={r.envasado.cajasProd} previo={p.envasado.cajasProd} />
+            <Kpi label="Cajas programadas" valor={r.envasado.cajasProg} />
+            <Kpi label="Cumplimiento" tipo="pct" valor={r.envasado.cump} tono={tonoCumplimiento(r.envasado.cump)} actual={r.envasado.cump} previo={p.envasado.cump} />
+            <Kpi label="Productividad" tipo="num1" unidad="bolsas/min" valor={r.envasado.productividad} actual={r.envasado.productividad} previo={p.envasado.productividad} />
+            <Kpi label="Tiempo efectivo" valor={r.envasado.tiempoEfectivo} unidad="min" actual={r.envasado.tiempoEfectivo} previo={p.envasado.tiempoEfectivo} />
+            <Kpi label="Detenciones" valor={r.envasado.detTotal} unidad="min" actual={r.envasado.detTotal} previo={p.envasado.detTotal} menorEsMejor />
+            <Kpi label="Merma de cajas" tipo="pct" valor={r.envasado.mermaCajas} actual={r.envasado.mermaCajas} previo={p.envasado.mermaCajas} menorEsMejor />
+            <Kpi label="Merma de bolsas" tipo="pct" valor={r.envasado.mermaBolsas} actual={r.envasado.mermaBolsas} previo={p.envasado.mermaBolsas} menorEsMejor />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <GraficoDiario svg={svg} titulo="Cajas producidas por día" mitad data={r.envasado.diarioCajas} color="#34d399" />
+            <GraficoDiario svg={svg} titulo="Cumplimiento por día" mitad data={r.envasado.diarioCump} formato="pct" color="#10b981" />
+          </div>
+          <div className="rep-bloque">
+            <p className="text-xs font-semibold text-slate-700 mb-2">Detenciones por motivo (Pareto)</p>
+            <ParetoDetenciones items={r.envasado.detPareto} total={r.envasado.detTotal} />
+          </div>
+        </SubBloque>
+
+        <SubBloque titulo="Línea 5" color="#0d9488">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <Kpi label="Kg ingresados" valor={r.envasado.l5Ing} actual={r.envasado.l5Ing} previo={p.envasado.l5Ing} />
+            <Kpi label="Kg aprobados" valor={r.envasado.l5Apr} actual={r.envasado.l5Apr} previo={p.envasado.l5Apr} />
+            <Kpi label="Rendimiento" tipo="pct" valor={r.envasado.l5Rend} actual={r.envasado.l5Rend} previo={p.envasado.l5Rend} />
+            <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={r.envasado.l5Cump} tono={tonoCumplimiento(r.envasado.l5Cump)} actual={r.envasado.l5Cump} previo={p.envasado.l5Cump} sub={r.envasado.l5Prog ? `${fmtNum(r.envasado.l5Prog)} Kg programados` : "Sin Kg programado"} />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <GraficoDiario svg={svg} titulo="Kg ingresados por día" data={r.envasado.l5DiarioIng} mitad color="#2dd4bf" />
+            <GraficoDiario svg={svg} titulo="Rendimiento por día" data={r.envasado.l5DiarioRend} mitad formato="pct" color="#0d9488" />
+          </div>
+        </SubBloque>
+      </SeccionArea>
+
+      {/* ---------- Seguridad ---------- */}
+      <SeccionArea titulo="Seguridad" color="#dc2626" salto>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Kpi label="Cierres con incidentes" valor={r.seguridad.incidentes} tono={r.seguridad.incidentes ? "warn" : "ok"} actual={r.seguridad.incidentes} previo={p.seguridad.incidentes} menorEsMejor />
+          <Kpi label="Cierres con accidentes" valor={r.seguridad.accidentes} tono={r.seguridad.accidentes ? "bad" : "ok"} actual={r.seguridad.accidentes} previo={p.seguridad.accidentes} menorEsMejor />
+          <Kpi label="Documentación pendiente" valor={r.seguridad.docsPendientes} tono={r.seguridad.docsPendientes ? "bad" : "ok"} />
+          <Kpi label="Turnos sin cierre" valor={r.turnosSinCierreTotal} tono={r.turnosSinCierreTotal ? "warn" : "ok"} />
+        </div>
+
+        <SubBloque titulo="Incidentes y accidentes por supervisor" color="#dc2626">
+          <p className="text-[11px] text-slate-500 -mt-1">Cada barra suma los casos de incidente y accidente; el color indica al supervisor responsable del cierre.</p>
+          <GraficoApilado titulo="Por día (período seleccionado)" data={sg.porDia} keys={sg.supervisores} colores={sg.colores} hay={sg.hayDia} />
+          <GraficoApilado titulo="Acumulado por semana (últimas 8 semanas, desde el lunes indicado)" data={sg.porSemana} keys={sg.supervisores} colores={sg.colores} hay={sg.haySemana} />
+          <GraficoApilado titulo="Acumulado por mes (últimos 6 meses)" data={sg.porMes} keys={sg.supervisores} colores={sg.colores} hay={sg.hayMes} />
+          {sg.tabla.length > 0 && (
+            <div className="rep-bloque overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-left text-slate-500 border-b border-slate-200">
+                    <th className="py-1.5 font-medium">Supervisor</th>
+                    <th className="py-1.5 font-medium text-right">Período · incidentes</th>
+                    <th className="py-1.5 font-medium text-right">Período · accidentes</th>
+                    <th className="py-1.5 font-medium text-right">{sg.mesLabel} · incidentes</th>
+                    <th className="py-1.5 font-medium text-right">{sg.mesLabel} · accidentes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sg.tabla.map((t) => (
+                    <tr key={t.sup} className="border-b border-slate-100 last:border-0">
+                      <td className="py-1.5 font-medium text-slate-900">
+                        <span className="inline-block w-2.5 h-2.5 rounded-sm mr-1.5 align-middle" style={{ background: sg.colores[t.sup] }} />{t.sup}
+                      </td>
+                      <td className="py-1.5 text-right">{t.perInc}</td>
+                      <td className={`py-1.5 text-right ${t.perAcc ? "text-red-600 font-semibold" : ""}`}>{t.perAcc}</td>
+                      <td className="py-1.5 text-right">{t.mesInc}</td>
+                      <td className={`py-1.5 text-right ${t.mesAcc ? "text-red-600 font-semibold" : ""}`}>{t.mesAcc}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </SubBloque>
+
+        <div>
+          <p className="rep-titulo text-xs font-semibold text-slate-700 mb-2">Reporte de accidentes e incidentes ({r.seguridad.eventos.length})</p>
+          <ListaEventos eventos={r.seguridad.eventos} />
+        </div>
+      </SeccionArea>
+    </div>
   );
 }
 
@@ -6855,114 +7489,130 @@ function JefeDashboard({ onBack }) {
   const lavado = useAreaCierres("lavado");
   const seleccion = useAreaCierres("seleccion");
   const envasado = useAreaCierres("envasado");
+  const [programas, , loadingP] = useSharedList("programa-records");
+  const { horarios } = useHorariosTurno();
+  const [modo, setModo] = useState("semana");
+  const [offset, setOffset] = useState(0);
+  const [verReporte, setVerReporte] = useState(false);
 
-  const todosCierres = [...lavado.cierres, ...seleccion.cierres, ...envasado.cierres];
-  const incidentes = todosCierres.filter((c) => c.huboIncidentes === "Sí").length;
-  const accidentes = todosCierres.filter((c) => c.huboAccidentes === "Sí").length;
+  const loading = lavado.loading || seleccion.loading || envasado.loading || loadingP;
+  const semana = semanaDe(sumarDias(today(), offset * 7));
+  const dias = modo === "semana" ? 7 : 28;
+  const hasta = semana.hasta;
+  const desde = sumarDias(hasta, -(dias - 1));
+  const datos = { lavado, seleccion, envasado, programas, horarios };
+  const r = loading ? null : resumenPeriodo(datos, desde, hasta);
+  const p = loading ? null : resumenPeriodo(datos, sumarDias(desde, -dias), sumarDias(desde, -1));
 
-  const cierresConArea = [
-    ...lavado.cierres.map((c) => ({ ...c, area: "Lavado de bandejas" })),
-    ...seleccion.cierres.map((c) => ({ ...c, area: "Selección" })),
-    ...envasado.cierres.map((c) => ({ ...c, area: "Envasado" })),
-  ];
-
-  const recientes = cierresConArea
-    .filter((c) => c.estado === "Enviado")
-    .sort((a, b) => new Date(b.fechaHoraCierre || 0) - new Date(a.fechaHoraCierre || 0))
-    .slice(0, 8);
-
-  // Reporte de accidentes e incidentes — un registro por CADA caso cargado en
-  // Comentarios del cierre (puede haber más de uno por turno), con el detalle
-  // de persona, qué pasó, y seguimiento de la documentación.
-  const reporteAccIncidentes = cierresConArea
-    .filter((c) => c.huboIncidentes === "Sí" || c.huboAccidentes === "Sí")
-    .sort((a, b) => new Date(b.fechaHoraCierre || 0) - new Date(a.fechaHoraCierre || 0))
-    .flatMap((c) => incidentesDeCierre(c).map((it, i) => ({ ...c, ...it, itemIdx: i })));
+  // El reporte siempre es de UNA semana (lunes a domingo): la semana seleccionada.
+  const rSemana = loading ? null : (dias === 7 ? r : resumenPeriodo(datos, semana.desde, semana.hasta));
+  const pSemana = loading ? null : resumenPeriodo(datos, sumarDias(semana.desde, -7), sumarDias(semana.desde, -1));
 
   return (
-    <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
-      <TopBar title="Indicadores generales" subtitle="Vista consolidada de las 3 áreas" onBack={onBack} icon={BarChart3} accent="emerald" />
+    <div className="w-full max-w-2xl lg:max-w-5xl mx-auto pb-10">
+      <TopBar title="Indicadores generales" subtitle="Vista ejecutiva de las 3 áreas" onBack={onBack} icon={BarChart3} accent="emerald" />
       <div className="p-4 space-y-4">
-        <Card title="Seguridad — acumulado">
-          <div className="flex flex-wrap gap-3">
-            <span className="flex items-center gap-1.5 text-sm font-medium rounded-lg border px-3 py-1.5 bg-amber-500/10 text-amber-700 border-amber-500/30">
-              <AlertTriangle size={16} /> Cierres con incidentes: {incidentes}
-            </span>
-            <span className="flex items-center gap-1.5 text-sm font-medium rounded-lg border px-3 py-1.5 bg-red-500/10 text-red-700 border-red-500/30">
-              <AlertTriangle size={16} /> Cierres con accidentes: {accidentes}
-            </span>
-          </div>
-        </Card>
+        <SelectorPeriodo modo={modo} setModo={setModo} offset={offset} setOffset={setOffset} desde={desde} hasta={hasta} />
 
-        <Card title={`Reporte de accidentes e incidentes (${reporteAccIncidentes.length})`}>
-          {reporteAccIncidentes.length === 0 ? (
-            <EmptyNote text="Sin incidentes ni accidentes registrados." />
-          ) : (
-            <div className="space-y-2">
-              {reporteAccIncidentes.map((c) => {
-                const tipos = [
-                  c.huboAccidentes === "Sí" ? "Accidente" : null,
-                  c.huboIncidentes === "Sí" ? "Incidente" : null,
-                ].filter(Boolean).join(" + ");
-                const docHecha = c.docHecha || "No";
-                const docEntregada = c.docEntregada || "No";
-                const pendiente = docHecha !== "Sí" || docEntregada !== "Sí";
-                return (
-                  <div
-                    key={`${c.area}-${c.id}-${c.itemIdx}`}
-                    className={`rounded-xl px-3 py-2.5 border ${pendiente ? "bg-red-50 border-red-200" : "bg-emerald-50 border-emerald-200"}`}
-                  >
-                    <div className="flex justify-between items-start gap-2">
-                      <span className="text-sm font-semibold text-slate-900">{tipos} · {c.area}</span>
-                      <span className="text-xs text-slate-600 shrink-0">{fmtFecha(c.fecha)} · {turnoLabel(c.turno)}</span>
-                    </div>
-                    <div className="text-xs text-slate-600 mt-1">Supervisor responsable: <b>{c.responsable || "—"}</b></div>
-                    <div className="text-xs text-slate-600">Persona involucrada: <b>{c.nombre || "—"}</b></div>
-                    {c.descripcion && (
-                      <div className="text-xs text-slate-600 mt-1">"{c.descripcion}"</div>
-                    )}
-                    <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs">
-                      <span className={docHecha === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>
-                        {docHecha === "Sí" ? "✓" : "⚠"} Documentación hecha: {docHecha}
-                      </span>
-                      <span className={docEntregada === "Sí" ? "text-emerald-700 font-medium" : "text-red-700 font-semibold"}>
-                        {docEntregada === "Sí" ? "✓" : "⚠"} Documentación entregada: {docEntregada}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </Card>
+        {loading ? <Card><Loader text="Calculando indicadores…" /></Card> : (
+          <>
+            <button
+              onClick={() => setVerReporte(true)}
+              className="w-full flex items-center justify-center gap-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl py-3 transition-colors"
+            >
+              <FileText size={18} /> Generar reporte semanal (PDF)
+              <span className="text-xs font-normal text-slate-300">· {fmtCorto(semana.desde)} al {fmtCorto(semana.hasta)}</span>
+            </button>
 
-        <MiniChart area={AREAS.lavado} inicio={lavado.inicio} cierres={lavado.cierres} />
-        <MiniChart area={AREAS.seleccion} inicio={seleccion.inicio} cierres={seleccion.cierres} />
-        <MiniChart area={AREAS.envasado} inicio={envasado.inicio} cierres={envasado.cierres} />
+            <PanelIndicadores r={r} p={p} />
 
-        <Card title="Cierres recientes">
-          {recientes.length === 0 ? <EmptyNote text="Todavía no se han finalizado cierres de turno." /> : (
-            <div className="space-y-2 text-sm">
-              {recientes.map((c) => (
-                <div key={`${c.area}-${c.id}`} className="border border-slate-300 rounded-lg px-3 py-2">
-                  <div className="flex justify-between">
-                    <span className="font-medium text-slate-900">{c.area}</span>
-                    <span className="text-slate-600">{fmtFecha(c.fecha)} · {c.turno}</span>
-                  </div>
-                  <div className="text-xs text-slate-600 mt-1">
-                    Responsable: {c.responsable || "—"} · Incidentes: {c.huboIncidentes || "No"} · Accidentes: {c.huboAccidentes || "No"}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </Card>
-
-        <p className="text-xs text-slate-500">
-          Para editar o eliminar registros de una área, entra a esa área y abre la pestaña «Registros».
-        </p>
+            <p className="text-xs text-slate-500">
+              Las variaciones comparan con el período anterior de igual duración. El color del cumplimiento es verde desde 95 %, ámbar desde 85 % y rojo bajo eso. Para editar o eliminar registros, entra al área y abre la pestaña «Registros».
+            </p>
+          </>
+        )}
       </div>
+
+      {verReporte && rSemana && (
+        <ReporteSemanalModal r={rSemana} p={pSemana} onClose={() => setVerReporte(false)} />
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reporte semanal (se abre en pantalla y se guarda como PDF con «Imprimir»).
+// Es el mismo panel de la pantalla de Indicadores, con encabezado y comentarios.
+// ---------------------------------------------------------------------------
+function ReporteSemanalModal({ r, p, onClose }) {
+  const ahora = fmtDateTime(new Date().toISOString());
+  const H2 = "text-[13px] font-bold text-slate-900 border-b-2 border-slate-800 pb-1 mb-2 mt-5";
+
+  return createPortal(
+    <div className="reporte-portal fixed inset-0 z-[100] bg-slate-200 overflow-auto">
+      <style>{`
+        @media print {
+          #root { display: none !important; }
+          .reporte-portal { position: static !important; overflow: visible !important; background: #fff !important; }
+          .no-print { display: none !important; }
+          #reporte-print { box-shadow: none !important; margin: 0 !important; max-width: none !important; padding: 0 !important; }
+          #reporte-print, #reporte-print * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          .rep-bloque { break-inside: avoid; }
+          .rep-salto { break-before: page; }
+          .rep-titulo { break-after: avoid; }
+          #reporte-print { background: #fff !important; }
+          @page { size: A4; margin: 10mm; }
+        }
+      `}</style>
+
+      <div className="no-print sticky top-0 z-10 flex items-center justify-between gap-2 bg-slate-900 text-white px-4 py-2.5">
+        <button onClick={onClose} className="flex items-center gap-1.5 text-sm hover:underline"><X size={16} /> Cerrar</button>
+        <button onClick={() => window.print()} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 font-semibold text-sm rounded-lg px-4 py-2">
+          <Printer size={16} /> Imprimir / Guardar como PDF
+        </button>
+      </div>
+      <p className="no-print text-center text-xs text-slate-600 px-4 pt-3">
+        En el cuadro de impresión elige «Guardar como PDF» como destino y luego compártelo.
+      </p>
+
+      <div id="reporte-print" className="bg-slate-50 text-slate-900 max-w-[820px] mx-auto my-3 p-5 shadow text-[11.5px] leading-snug">
+        <div className="rep-bloque flex items-start justify-between rounded-2xl bg-slate-900 text-white px-5 py-4 mb-4">
+          <div>
+            <div className="text-lg font-extrabold">Reporte semanal de producción</div>
+            <div className="text-slate-300">IQF Congelado · Planta Curicó</div>
+          </div>
+          <div className="text-right">
+            <div className="font-bold">Semana {fmtFecha(r.desde)} – {fmtFecha(r.hasta)}</div>
+            <div className="text-slate-300">Generado el {ahora}</div>
+          </div>
+        </div>
+
+        <PanelIndicadores r={r} p={p} svg />
+
+        {r.comentarios.length > 0 && (
+          <div className="rep-bloque">
+            <div className={H2}>Comentarios de los turnos</div>
+            <table className="w-full">
+              <tbody>
+                {r.comentarios.slice(0, 12).map((c, i) => (
+                  <tr key={i} className="border-b border-slate-200 align-top">
+                    <td className="py-1 px-2 whitespace-nowrap text-slate-500">{fmtCorto(c.fecha)} {c.turno}</td>
+                    <td className="py-1 px-2 whitespace-nowrap">{c.area} · {c.tema}</td>
+                    <td className="py-1 px-2">{c.texto.length > 220 ? `${c.texto.slice(0, 220)}…` : c.texto}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {r.comentarios.length > 12 && <div className="text-[10px] text-slate-500 mt-1">Se muestran los 12 comentarios más recientes de {r.comentarios.length}.</div>}
+          </div>
+        )}
+
+        <div className="text-[10px] text-slate-500 mt-4">
+          Las variaciones comparan con la semana anterior (puntos porcentuales para porcentajes, % para el resto). Cumplimiento: verde desde 95 %, ámbar desde 85 %, rojo bajo eso.
+        </div>
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -7250,7 +7900,7 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
           <div className="pt-2 space-y-2">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest px-1">Jefe de producción</p>
             {[
-              { key: "dashboard",        label: "Indicadores generales",       desc: "Dashboard de las 3 áreas", Icon: BarChart3 },
+              { key: "dashboard",        label: "Indicadores generales",       desc: "Vista ejecutiva de las 3 áreas y reporte semanal en PDF", Icon: BarChart3 },
               { key: "programa",         label: "Programa de producción",      desc: "Línea, turno, especie y cantidad", Icon: CalendarDays },
               { key: "supervisores",     label: "Gestionar Supervisores",      desc: "Agregar o eliminar supervisores de los portales", Icon: User },
               { key: "horarios",         label: "Horarios de Turno",           desc: "Lunes a Sábado — minutos efectivos por turno", Icon: Clock },
