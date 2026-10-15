@@ -6,7 +6,7 @@ import App from "./App.jsx";
 // ── Google Sheets sync URL ──────────────────────────────────────────────────
 // Pega aquí la URL que te entrega Apps Script al implementar Code_Bitacora.gs
 // Ejemplo: "https://script.google.com/macros/s/AKfycb.../exec"
-window.__SHEETS_URL__ = "https://script.google.com/macros/s/AKfycbxjT0kYoffxpMcHGbydcRKU05JdSPzg7WEhIF_S3eO0AWux4qlSTvzg2ZZPq_r8iEG7/exec";
+window.__SHEETS_URL__ = "";
 
 // ── Storage polyfill (localStorage + sincronización con Google Sheets) ─────
 // - set(): guarda local Y envía al Sheet (si hay URL configurada).
@@ -94,7 +94,7 @@ window.storage = {
     if (!window.__SHEETS_URL__) return { ok: true }; // sin URL configurada: no hay nada que sincronizar
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       const res = await fetch(window.__SHEETS_URL__, {
         method: "POST",
         body: JSON.stringify(body),
