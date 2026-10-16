@@ -6,7 +6,7 @@ import App from "./App.jsx";
 // ── Google Sheets sync URL ──────────────────────────────────────────────────
 // Pega aquí la URL que te entrega Apps Script al implementar Code_Bitacora.gs
 // Ejemplo: "https://script.google.com/macros/s/AKfycb.../exec"
-window.__SHEETS_URL__ = "";
+window.__SHEETS_URL__ = "https://script.google.com/macros/s/AKfycbxjT0kYoffxpMcHGbydcRKU05JdSPzg7WEhIF_S3eO0AWux4qlSTvzg2ZZPq_r8iEG7/exec";
 
 // ── Storage polyfill (localStorage + sincronización con Google Sheets) ─────
 // - set(): guarda local Y envía al Sheet (si hay URL configurada).
