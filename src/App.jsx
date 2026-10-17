@@ -4183,7 +4183,8 @@ function especiesActivasLinea(l, inicio, values) {
       const proceso = (inicio?.[campo] ?? values[campo]) || "";
       return { s, proceso };
     })
-    .filter((x) => x.proceso);
+    // Las especies que el supervisor quitó en el Cierre no se consideran.
+    .filter((x) => x.proceso && !values?.[`quitada_${l.key}_e${x.s}`]);
   return slots.length > 0 ? slots : [{ s: 1, proceso: "—" }];
 }
 
@@ -4322,16 +4323,31 @@ function SeleccionCierre({ values, setField, inicio, programaEntries }) {
               const especiesLinea = especiesUnicas(procesosCompletos);
               return (
                 <div key={l.key} className="border border-slate-300 rounded-lg p-3 space-y-3">
-                  <div className="text-sm font-semibold text-slate-900">{l.label}</div>
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold text-slate-900">{l.label}</div>
+                    {ESPECIE_SLOTS.some((s) => values[`quitada_${l.key}_e${s}`]) && (
+                      <button type="button" onClick={() => ESPECIE_SLOTS.forEach((s) => { if (values[`quitada_${l.key}_e${s}`]) setField(`quitada_${l.key}_e${s}`, false); })}
+                        className="text-xs text-blue-600 underline">Restaurar especies quitadas</button>
+                    )}
+                  </div>
                   {especies.map(({ s, proceso }) => {
                     const ing = num(values[`kg_${l.key}_e${s}_ing`]);
                     const apr = kgAprobadoTotal(values, l.key, s);
                     const rend = ing ? apr / ing : 0;
                     return (
                       <div key={s} className="border border-slate-200 bg-slate-50 rounded-lg p-2.5 space-y-2">
-                        <div className="flex justify-between text-xs">
+                        <div className="flex justify-between items-start gap-2 text-xs">
                           {especies.length > 1 && <span className="font-semibold text-slate-500">Especie {s}</span>}
-                          <span className="text-slate-700 font-medium">{proceso}</span>
+                          <span className="text-slate-700 font-medium text-right flex-1">{proceso}</span>
+                          {especies.length > 1 && (
+                            <button type="button" aria-label={`Quitar especie ${s}`} onClick={() => {
+                              setField(`quitada_${l.key}_e${s}`, true);
+                              setField(`kg_${l.key}_e${s}_ing`, "");
+                              APROBADO_SLOTS.forEach((t) => { setField(`kg_${l.key}_e${s}_apr_t${t}_tipo`, ""); setField(`kg_${l.key}_e${s}_apr_t${t}_kg`, ""); });
+                            }} className="flex items-center gap-1 font-medium text-rose-600 border border-rose-200 rounded-md px-2 py-0.5 hover:bg-rose-50">
+                              <Trash2 size={12} /> Quitar
+                            </button>
+                          )}
                         </div>
                         <NumField label="Kg ingresados" value={values[`kg_${l.key}_e${s}_ing`]} onChange={(v) => setField(`kg_${l.key}_e${s}_ing`, v)} />
                         <KgAprobadoRows lineaKey={l.key} slot={s} values={values} setField={setField} tipos={especiesLinea} />
@@ -4484,6 +4500,10 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
     return [...set];
   }, [programaEntries, values.turno]);
 
+  // Entradas del Programa para cada línea (para mostrar "N prog." como en Selección).
+  const progEnvasadora = programaEntries.filter((e) => e.lineaKey === "envasadora" && e.especie !== "LAVADO");
+  const progLinea5 = programaEntries.filter((e) => (e.lineaKey === "linea5" || e.linea === "linea5") && e.especie !== "LAVADO");
+
   // Si hay un único SKU programado y todavía no se ha elegido ninguno, lo preselecciona.
   useEffect(() => {
     if (activaEnvasadora && !values.envasadora_sku && skusProgramadosTurno.length === 1) {
@@ -4562,6 +4582,10 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
           <div className="border border-slate-300 rounded-lg p-3 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold text-slate-900">Envasadora</span>
+              <div className="flex items-center gap-2">
+              {progEnvasadora.length > 0 && !activaEnvasadora && (
+                <span className="text-xs bg-blue-100 text-blue-700 border border-blue-200 rounded-full px-2 py-0.5">{progEnvasadora.length} prog.</span>
+              )}
               <button
                 type="button"
                 onClick={() => setField("activa_envasadora", activaEnvasadora ? "No" : "Sí")}
@@ -4571,9 +4595,15 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
               >
                 {activaEnvasadora ? "Activa" : "Inactiva"}
               </button>
+              </div>
             </div>
             {activaEnvasadora && (
               <div className="space-y-2">
+                {progEnvasadora.length > 0 ? (
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-xs text-blue-800">✓ SKU cargado desde el Programa de producción.</div>
+                ) : (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">⚠ Esta línea está activa pero el Programa de producción no tiene nada asignado para este turno. Verifica si el Programa cambió a otra línea.</div>
+                )}
                 <SkuPicker
                   label="Código SKU"
                   value={values.envasadora_sku}
@@ -4596,6 +4626,10 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
           <div className="border border-slate-300 rounded-lg p-3 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold text-slate-900">Línea 5</span>
+              <div className="flex items-center gap-2">
+              {progLinea5.length > 0 && !activaLinea5 && (
+                <span className="text-xs bg-blue-100 text-blue-700 border border-blue-200 rounded-full px-2 py-0.5">{progLinea5.length} prog.</span>
+              )}
               <button
                 type="button"
                 onClick={() => setField("activa_linea5", activaLinea5 ? "No" : "Sí")}
@@ -4605,9 +4639,13 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
               >
                 {activaLinea5 ? "Activa" : "Inactiva"}
               </button>
+              </div>
             </div>
             {activaLinea5 && (
               <div className="space-y-2">
+                {progLinea5.length === 0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">⚠ Esta línea está activa pero el Programa de producción no tiene nada asignado para este turno. Verifica si el Programa cambió a otra línea.</div>
+                )}
                 {especiesLinea5Prog.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 mb-1">
                     {especiesLinea5Prog.map((esp) => (
@@ -6773,11 +6811,28 @@ function RegistrosTab({ area, onEdit, onEditCierre }) {
   const removeInicio = async (id) => { await saveInicio(inicioRecords.filter((r) => r.id !== id)); setConfirm(null); };
   const removeCierre = async (id) => { await saveCierre(cierreRecords.filter((r) => r.id !== id)); setConfirm(null); };
 
-  const sortedInicio = [...inicioRecords].sort((a, b) => b.id - a.id);
-  const sortedCierre = [...cierreRecords].sort((a, b) => b.id - a.id);
+  // Para que la app no se vuelva lenta con tanto historial: solo se listan los
+  // registros de la semana en curso (lunes a domingo) y los del último día
+  // trabajado de la semana pasada. «Ver historial completo» los muestra todos.
+  const [verTodo, setVerTodo] = useState(false);
+  const lunes = semanaDe(today()).desde;
+  const fechasPrevias = [...inicioRecords, ...cierreRecords].map((r) => r.fecha).filter((f) => f && f < lunes).sort();
+  const ultimoDiaPrevio = fechasPrevias[fechasPrevias.length - 1];
+  const visible = (r) => verTodo || !r.fecha || r.fecha >= lunes || r.fecha === ultimoDiaPrevio;
+  const sortedInicio = inicioRecords.filter(visible).sort((a, b) => b.id - a.id);
+  const sortedCierre = cierreRecords.filter(visible).sort((a, b) => b.id - a.id);
+  const ocultos = inicioRecords.length + cierreRecords.length - sortedInicio.length - sortedCierre.length;
 
   return (
     <div className="space-y-4">
+      <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
+        <span>{verTodo ? "Mostrando todo el historial." : `Mostrando la semana en curso${ultimoDiaPrevio ? ` y el último día trabajado de la semana pasada (${fmtFecha(ultimoDiaPrevio)})` : ""}.`}</span>
+        {(verTodo || ocultos > 0) && (
+          <button type="button" onClick={() => setVerTodo(!verTodo)} className="shrink-0 font-medium text-blue-600 underline">
+            {verTodo ? "Ver menos" : `Ver historial completo (${ocultos} más)`}
+          </button>
+        )}
+      </div>
       <Card title="Registros de inicio de turno">
         {loadingI ? <Loader /> : sortedInicio.length === 0 ? <EmptyNote text="Sin registros." /> : (
           <div className="space-y-2">
