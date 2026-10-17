@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import {
   Droplets, Filter, Package, ClipboardCheck, ClipboardList, BarChart3, Settings, X, Lock,
@@ -61,6 +61,11 @@ const fmtFecha = (iso) => {
   const [y, m, d] = iso.split("-");
   return `${d}/${m}/${y}`;
 };
+// Si por un reintento de guardado quedaron varios registros del mismo turno,
+// vale el más reciente (mayor id).
+const masRecientePorClave = (lista, clave) =>
+  (lista || []).reduce((best, r) => (r.claveTurno === clave && (!best || (r.id || 0) >= (best.id || 0)) ? r : best), null);
+
 const claveTurno = (fecha, turno) => (fecha && turno ? `${fecha}|${turno}` : null);
 const fmtDateTime = (iso) => {
   if (!iso) return "—";
@@ -554,6 +559,8 @@ function SupervisorSelect({ area, value, onChange, supervisoresList }) {
 // Trae al "Inicio de turno" los valores de cierre del turno anterior
 // (p. ej. pallets pendientes -> pallets sucios, materiales piso planta fin -> inicio).
 // Solo completa campos vacíos y solo si no se está editando un registro existente.
+const esCampoLista = (campo) => /^mtc(Cajas|Bolsas)Sku/.test(String(campo));
+
 function useCarryOver(areaKey, values, setField, editingId, mapping) {
   const [cierres] = useSharedList(`${areaKey}-cierre-records`);
 
@@ -567,7 +574,7 @@ function useCarryOver(areaKey, values, setField, editingId, mapping) {
   let prevCierre = null;
   for (let pasos = 0; prev && !prevCierre && pasos < 60; pasos++) {
     const clave = claveTurno(prev.fecha, prev.turno);
-    prevCierre = cierres.find((c) => c.claveTurno === clave) || null;
+    prevCierre = masRecientePorClave(cierres, clave);
     if (!prevCierre) prev = turnoAnterior(prev.fecha, prev.turno);
   }
 
@@ -580,13 +587,21 @@ function useCarryOver(areaKey, values, setField, editingId, mapping) {
       // Inicio parten iguales a los del fin de ese cierre.
       mapping.forEach(([source, target]) => {
         const v = prevCierre[source];
-        if (v !== undefined && v !== "") setField(target, v);
+        if (v === undefined || v === "") return;
+        // Los campos "por SKU" son listas de filas: solo se copian si realmente
+        // son listas (y se copian las filas, no la misma referencia).
+        if (esCampoLista(target)) {
+          if (Array.isArray(v)) setField(target, v.map((r) => ({ ...r })));
+          return;
+        }
+        setField(target, v);
       });
     } else if (values.fecha && values.turno) {
       // No hubo cierre anterior registrado: los materiales de piso planta
       // parten en 0 (explícito, no en blanco, para no confundir "sin dato"
       // con "en cero" al mirar el registro después).
-      mapping.forEach(([, target]) => setField(target, "0"));
+      // (Los campos "por SKU" son listas: se dejan vacíos, nunca en "0".)
+      mapping.forEach(([, target]) => { if (!esCampoLista(target)) setField(target, "0"); });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [values.fecha, values.turno, prevCierre?.id, editingId]);
@@ -1451,7 +1466,17 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries, horarios) {
     }
     if (produccion.length > 0) {
       lineas.push("*Producción:*");
-      produccion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      // Entradas especiales: "#" = título de una línea (negrita, con espacio
+      // arriba); "##" = subtítulo (proceso/SKU dentro de la línea).
+      // "=" = encabezado con viñeta (sus datos van debajo, sin viñeta);
+      // tercer valor "plano" = línea sin viñeta.
+      produccion.forEach(([label, value, estilo]) => {
+        if (label === "#") { lineas.push(""); lineas.push(`*${value}*`); }
+        else if (label === "##") lineas.push(`_${value}_`);
+        else if (label === "=") lineas.push(`• ${value}`);
+        else if (estilo === "plano") lineas.push(`${label}: ${value ?? "—"}`);
+        else lineas.push(`• ${label}: ${value ?? "—"}`);
+      });
       lineas.push("");
     }
     if (materiales.length > 0) {
@@ -3786,7 +3811,7 @@ function MaterialesTable({ items, values, setField, prefix, excludeIndices }) {
 
 // Suma el campo "cantidad" a través de todas las filas de un desglose de MTC por SKU.
 function sumMtcSku(rows) {
-  return (rows || []).reduce((sum, r) => sum + (Number(r && r.cantidad) || 0), 0);
+  return (Array.isArray(rows) ? rows : []).reduce((sum, r) => sum + (Number(r && r.cantidad) || 0), 0);
 }
 
 // Editor de "Cantidad MTC Cajas" o "Cantidad MTC Bolsas" desglosado por
@@ -3799,18 +3824,30 @@ function sumMtcSku(rows) {
 // filas) se guarda además en el campo legacy `legacyField` para mantener
 // compatibilidad con el índice posicional de MATERIALES_ENVASADO (usado por
 // el histórico de stock, alertas y registros antiguos).
-function MtcPorSkuEditor({ title, unitLabel, skusProgramados, values, setField, fieldName, legacyField }) {
-  const rows = values[fieldName] || [];
+function MtcPorSkuEditor({ title, unitLabel, skusProgramados, values, setField, fieldName, legacyField, referencia }) {
+  const rows = Array.isArray(values[fieldName]) ? values[fieldName] : [];
   const skusKey = (skusProgramados || []).join(",");
+  // Si el usuario quita a propósito todas las filas, no se vuelven a precargar solas.
+  const vacioAProposito = useRef(false);
+  useEffect(() => { vacioAProposito.current = false; }, [skusKey]);
+  // Cantidad que se registró en el Inicio de turno para cada MTC (solo referencia en el Cierre).
+  const refDe = (sku) => {
+    const f = (Array.isArray(referencia) ? referencia : []).find((x) => x && x.sku === sku);
+    return f && f.cantidad !== "" && f.cantidad != null ? f.cantidad : null;
+  };
 
   // Si aún no hay filas y hay SKU(s) programados para el turno, precarga
   // una fila por cada uno para que el usuario solo tenga que ingresar la cantidad.
+  // Depende también de rows.length: si el formulario se reinicia después de
+  // elegir el turno (como en el Cierre), las filas se vuelven a precargar.
   useEffect(() => {
-    if (rows.length === 0 && skusProgramados && skusProgramados.length > 0) {
+    if (rows.length === 0 && !vacioAProposito.current && skusProgramados && skusProgramados.length > 0) {
       setField(fieldName, skusProgramados.map((sku) => ({ sku, cantidad: "" })));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [skusKey]);
+    // Sin lista de dependencias a propósito: el formulario del Cierre se reinicia
+    // DESPUÉS de elegir el turno y borraba las filas recién precargadas.
+    // La condición evita bucles (solo actúa si no hay filas).
+  });
 
   // Mantiene sincronizado el total legacy con la suma de las filas.
   const rowsKey = JSON.stringify(rows);
@@ -3824,15 +3861,26 @@ function MtcPorSkuEditor({ title, unitLabel, skusProgramados, values, setField, 
     setField(fieldName, next);
   };
   const addRow = () => setField(fieldName, [...rows, { sku: "", cantidad: "" }]);
-  const removeRow = (i) => setField(fieldName, rows.filter((_, idx) => idx !== i));
+  const removeRow = (i) => {
+    const next = rows.filter((_, idx) => idx !== i);
+    if (next.length === 0) vacioAProposito.current = true;
+    setField(fieldName, next);
+  };
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-sm font-semibold text-slate-900">{title} por SKU</span>
-        <button type="button" onClick={addRow} className="text-xs text-emerald-700 font-medium hover:underline">
-          + Agregar SKU
-        </button>
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={addRow} className="text-xs text-emerald-700 font-medium hover:underline">
+            + Agregar SKU
+          </button>
+          {rows.length > 0 && (
+            <button type="button" onClick={() => removeRow(rows.length - 1)} className="text-xs text-rose-600 font-medium hover:underline">
+              − Quitar SKU
+            </button>
+          )}
+        </div>
       </div>
       {rows.length === 0 ? (
         <p className="text-xs text-slate-400 italic">Sin SKU registrados. Agrega uno manualmente o prográmalo en el turno.</p>
@@ -3841,9 +3889,12 @@ function MtcPorSkuEditor({ title, unitLabel, skusProgramados, values, setField, 
           {rows.map((row, i) => (
             <div key={i} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 items-end border border-slate-200 rounded-lg p-2">
               <TextField label="MTC / SKU" value={row.sku} onChange={(v) => updateRow(i, "sku", v)} />
-              <NumField label={title} unit={unitLabel} value={row.cantidad} onChange={(v) => updateRow(i, "cantidad", v)} />
-              <button type="button" onClick={() => removeRow(i)} className="text-xs text-rose-600 hover:underline pb-2">
-                Quitar
+              <div>
+                <NumField label={title} unit={unitLabel} value={row.cantidad} onChange={(v) => updateRow(i, "cantidad", v)} />
+                {refDe(row.sku) != null && <div className="text-[11px] text-slate-500 mt-0.5">Al inicio del turno: <b>{fmtNum(num(refDe(row.sku)))}</b> {unitLabel}</div>}
+              </div>
+              <button type="button" onClick={() => removeRow(i)} className="flex items-center justify-center gap-1 text-xs font-medium text-rose-600 border border-rose-200 rounded-lg px-3 py-2 hover:bg-rose-50">
+                <Trash2 size={13} /> Quitar SKU
               </button>
             </div>
           ))}
@@ -4737,13 +4788,13 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
   // registró ninguno se recurre, como respaldo, a los MTC que la
   // especificación del SKU define para lo programado en este turno.
   const skusCajasIniciales = useMemo(() => {
-    const desdeInicio = (inicio?.mtcCajasSkuInicio || []).map((r) => r.sku).filter(Boolean);
+    const desdeInicio = (Array.isArray(inicio?.mtcCajasSkuInicio) ? inicio.mtcCajasSkuInicio : []).map((r) => r.sku).filter(Boolean);
     return desdeInicio.length > 0 ? desdeInicio : mtcCajasProgramados;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inicio, mtcCajasProgramados.join(",")]);
 
   const skusBolsasIniciales = useMemo(() => {
-    const desdeInicio = (inicio?.mtcBolsasSkuInicio || []).map((r) => r.sku).filter(Boolean);
+    const desdeInicio = (Array.isArray(inicio?.mtcBolsasSkuInicio) ? inicio.mtcBolsasSkuInicio : []).map((r) => r.sku).filter(Boolean);
     return desdeInicio.length > 0 ? desdeInicio : mtcBolsasProgramados;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inicio, mtcBolsasProgramados.join(",")]);
@@ -4790,8 +4841,39 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
     .reduce((s, p) => s + num(p.cantidad), 0);
   const cumplimientoLinea5 = kgProgLinea5 ? m.l5Ing / kgProgLinea5 : 0;
 
+  // Igual que en Selección: qué líneas quedaron activas en el Inicio de turno y
+  // si el Programa de producción de este turno coincide con ellas.
+  const progEnv = (programaEntries || []).filter((p) => p.lineaKey === "envasadora" && p.especie !== "LAVADO");
+  const progL5 = (programaEntries || []).filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO");
+  const avisos = [];
+  if (inicio && activaEnvasadora && progEnv.length === 0) avisos.push("Envasadora está activa (desde el Inicio de turno) pero el Programa de producción no tiene nada asignado a Envasadora en este turno.");
+  if (inicio && activaLinea5 && progL5.length === 0) avisos.push("Línea 5 está activa (desde el Inicio de turno) pero el Programa de producción no tiene nada asignado a Línea 5 en este turno.");
+  if (inicio && !activaEnvasadora && progEnv.length > 0) avisos.push("El Programa tiene Envasadora asignada para este turno, pero no está marcada como activa en el Inicio de turno. Actívala en el Inicio para que aparezca aquí.");
+  if (inicio && !activaLinea5 && progL5.length > 0) avisos.push("El Programa tiene Línea 5 asignada para este turno, pero no está marcada como activa en el Inicio de turno. Actívala en el Inicio para que aparezca aquí.");
+
   return (
     <div className="space-y-4">
+      {avisos.length > 0 && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 space-y-2">
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={18} className="text-amber-600 shrink-0 mt-0.5" />
+            <div className="text-sm font-semibold text-amber-800">Revisa las líneas activas de este turno</div>
+          </div>
+          {avisos.map((a, i) => <p key={i} className="text-xs text-amber-700 pl-6">{a}</p>)}
+        </div>
+      )}
+
+      <Card title="Líneas activas del turno">
+        <div className="flex flex-wrap gap-2">
+          {[["Envasadora", activaEnvasadora], ["Línea 5", activaLinea5]].map(([nombre, on]) => (
+            <span key={nombre} className={`text-xs font-medium rounded-full px-3 py-1 border ${on ? "bg-emerald-50 border-emerald-300 text-emerald-700" : "bg-slate-100 border-slate-300 text-slate-500"}`}>
+              {on ? "✓" : "—"} {nombre} · {on ? "Activa" : "Inactiva"}
+            </span>
+          ))}
+        </div>
+        {!inicio && <p className="text-xs text-amber-700 mt-2">No hay inicio de turno registrado para esta fecha y turno, por eso no se conocen las líneas activas.</p>}
+      </Card>
+
       <Card title="Materiales piso planta (fin de turno)" step={1}>
         <MaterialesTable items={MATERIALES_ENVASADO} values={values} setField={setField} prefix="finMat" excludeIndices={[3, 4]} />
         <div className="mt-4 pt-4 border-t border-slate-200 space-y-4">
@@ -4803,6 +4885,7 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
             setField={setField}
             fieldName="mtcCajasSkuFin"
             legacyField="finMat_3"
+            referencia={inicio?.mtcCajasSkuInicio}
           />
           <MtcPorSkuEditor
             title="Cantidad MTC Bolsas"
@@ -4812,6 +4895,7 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
             setField={setField}
             fieldName="mtcBolsasSkuFin"
             legacyField="finMat_4"
+            referencia={inicio?.mtcBolsasSkuInicio}
           />
         </div>
       </Card>
@@ -5990,14 +6074,16 @@ function resumenLavadoCierreCompleto(r, inicio) {
     ["Comentarios dotación", src.comentariosDotacion || "—"],
   ];
   const produccion = [];
+  produccion.push(["=", "Lavados"]);
   TIPOS_BANDEJA.forEach((t) => {
     const v = palletsValue(r, "lavados", t);
-    if (v > 0) produccion.push([`Lavados · ${t.label}`, `${fmtNum(v)} pallets`]);
+    if (v > 0) produccion.push([t.label, `${fmtNum(v)} pallets`, "plano"]);
   });
   produccion.push(["Total pallets lavados", fmtNum(totalPalletsFromPrefix(r, "lavados"))]);
+  produccion.push(["=", "Pendientes"]);
   TIPOS_BANDEJA.forEach((t) => {
     const v = num(r[`pendientes_${t.key}_pallets`]);
-    if (v > 0) produccion.push([`Pendientes · ${t.label}`, `${fmtNum(v)} pallets`]);
+    if (v > 0) produccion.push([t.label, `${fmtNum(v)} pallets`, "plano"]);
   });
   produccion.push(["Total pallets pendientes", fmtNum(totalPalletsManual(r, "pendientes"))]);
   const materiales = [
@@ -6088,32 +6174,25 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
     const { cumplimiento, kgProgramado, kgIngresado } = computeSeleccionCumplimiento(r, inicio, programaEntries);
     produccion.push(["Rendimiento total", fmtPct(rendTotal)]);
     produccion.push(["Cumplimiento", kgProgramado ? `${fmtPct(cumplimiento)} (${fmtNum(kgIngresado, 0)}/${fmtNum(kgProgramado, 0)} Kg)` : "Sin Kg programado"]);
+    // Primero el resultado general del turno (arriba) y después el detalle de
+    // cada línea: Rendimiento y Cumplimiento de la línea, y luego sus procesos.
     activas.forEach((l) => {
       const especies = especiesActivasLinea(l, inicio, r);
-      especies.forEach(({ s, proceso }) => {
-        const ing = num(r[`kg_${l.key}_e${s}_ing`]);
-        const apr = kgAprobadoTotal(r, l.key, s);
-        const rend = ing ? apr / ing : 0;
-        const prefijo = especies.length > 1 ? `${l.label} · ${proceso}` : l.label;
-        produccion.push([`${prefijo} · Kg ingresados`, fmtNum(ing)]);
-        APROBADO_SLOTS.forEach((t) => {
-          const tipo = r[`kg_${l.key}_e${s}_apr_t${t}_tipo`];
-          const kg = r[`kg_${l.key}_e${s}_apr_t${t}_kg`];
-          if (tipo && kg !== undefined && kg !== "") {
-            produccion.push([`${prefijo} · Aprobado (${tipo})`, fmtNum(num(kg))]);
-          }
-        });
-        produccion.push([`${prefijo} · Kg aprobados total`, fmtNum(apr)]);
-        produccion.push([`${prefijo} · Rendimiento`, fmtPct(rend)]);
-      });
-      // Cumplimiento propio de esta línea (Kg ingresados de la línea / Kg
-      // programados para la línea) — además del cumplimiento global de arriba.
       const kgProgLinea = (programaEntries || [])
         .filter((p) => (p.lineaKey === l.key || p.linea === l.key) && p.especie !== "LAVADO")
         .reduce((s, p) => s + num(p.cantidad), 0);
-      const kgIngLinea = lineaKgTotales(r, l).ing;
-      const cumplimientoLinea = kgProgLinea ? kgIngLinea / kgProgLinea : 0;
-      produccion.push([`${l.label} · Cumplimiento`, kgProgLinea ? `${fmtPct(cumplimientoLinea)} (${fmtNum(kgIngLinea, 0)}/${fmtNum(kgProgLinea, 0)} Kg)` : "Sin Kg programado"]);
+      const tot = lineaKgTotales(r, l);
+      produccion.push(["#", l.label]);
+      produccion.push(["Rendimiento", tot.ing ? fmtPct(tot.apr / tot.ing) : "—"]);
+      produccion.push(["Cumplimiento", kgProgLinea ? `${fmtPct(tot.ing / kgProgLinea)} (${fmtNum(tot.ing, 0)}/${fmtNum(kgProgLinea, 0)} Kg)` : "Sin Kg programado"]);
+      especies.forEach(({ s, proceso }) => {
+        const ing = num(r[`kg_${l.key}_e${s}_ing`]);
+        const apr = kgAprobadoTotal(r, l.key, s);
+        produccion.push(["##", proceso]);
+        produccion.push(["Kg ingresados", fmtNum(ing)]);
+        produccion.push(["Kg aprobados", fmtNum(apr)]);
+        produccion.push(["Rendimiento", fmtPct(ing ? apr / ing : 0)]);
+      });
     });
   }
 
@@ -6163,7 +6242,7 @@ function resumenEnvasadoInicioCompleto(r) {
 // MTC distintos e independientes) en líneas de mensaje, una por cada
 // SKU/MTC que tenga cantidad registrada.
 function materialesMtcSkuLines(rows, unitLabel) {
-  return (rows || [])
+  return (Array.isArray(rows) ? rows : [])
     .filter((row) => num(row.cantidad) > 0)
     .map((row) => [`Material · MTC ${unitLabel} ${row.sku || "—"}`, fmtNum(row.cantidad || 0)]);
 }
@@ -6183,39 +6262,38 @@ function resumenEnvasadoCierreCompleto(r, inicio, programaEntries, horarios) {
   const produccion = [];
   const activaLinea5 = (inicio?.activa_linea5 ?? r.activa_linea5) === "Sí";
   const activaEnvasadora = (inicio?.activa_envasadora ?? r.activa_envasadora) === "Sí";
+  const mEnv = computeEnvasadoMetrics(r);
+  const kgProgLinea5 = (programaEntries || [])
+    .filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO")
+    .reduce((s, p) => s + num(p.cantidad), 0);
+  // Resultado general del turno (arriba) y después el detalle de cada línea.
+  if (activaEnvasadora) produccion.push(["Cumplimiento Envasadora", fmtPct(mEnv.cumplimiento)]);
   if (activaLinea5) {
-    const m = computeEnvasadoMetrics(r);
-    // Mismo formato que el cierre de las líneas de Selección: Kg ingresados,
-    // desglose de "Aprobado (tipo)", Kg aprobados total, Rendimiento y Cumplimiento.
-    produccion.push(["Línea 5 · Especie", inicio?.linea5_especie || r.linea5_especie || "—"]);
-    produccion.push(["Línea 5 · Proceso", r.l5_proceso || "—"]);
-    produccion.push(["Línea 5 · Kg ingresados", fmtNum(m.l5Ing)]);
-    APROBADO_SLOTS.forEach((t) => {
-      const tipo = r[`kg_linea5_e1_apr_t${t}_tipo`];
-      const kg = r[`kg_linea5_e1_apr_t${t}_kg`];
-      if (tipo && kg !== undefined && kg !== "") {
-        produccion.push([`Línea 5 · Aprobado (${tipo})`, fmtNum(num(kg))]);
-      }
-    });
-    produccion.push(["Línea 5 · Kg aprobados total", fmtNum(m.l5Apr)]);
-    produccion.push(["Línea 5 · Rendimiento", fmtPct(m.rendimientoLinea5)]);
-    const kgProgLinea5 = (programaEntries || [])
-      .filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO")
-      .reduce((s, p) => s + num(p.cantidad), 0);
-    const cumplimientoLinea5 = kgProgLinea5 ? m.l5Ing / kgProgLinea5 : 0;
-    produccion.push(["Línea 5 · Cumplimiento", kgProgLinea5 ? `${fmtPct(cumplimientoLinea5)} (${fmtNum(m.l5Ing, 0)}/${fmtNum(kgProgLinea5, 0)} Kg)` : "Sin Kg programado"]);
+    produccion.push(["Rendimiento Línea 5", fmtPct(mEnv.rendimientoLinea5)]);
+    produccion.push(["Cumplimiento Línea 5", kgProgLinea5 ? `${fmtPct(mEnv.l5Ing / kgProgLinea5)} (${fmtNum(mEnv.l5Ing, 0)}/${fmtNum(kgProgLinea5, 0)} Kg)` : "Sin Kg programado"]);
+  }
+  if (activaLinea5) {
+    const m = mEnv;
+    produccion.push(["#", "Línea 5"]);
+    produccion.push(["Rendimiento", fmtPct(m.rendimientoLinea5)]);
+    produccion.push(["Cumplimiento", kgProgLinea5 ? `${fmtPct(m.l5Ing / kgProgLinea5)} (${fmtNum(m.l5Ing, 0)}/${fmtNum(kgProgLinea5, 0)} Kg)` : "Sin Kg programado"]);
+    produccion.push(["Especie", inicio?.linea5_especie || r.linea5_especie || "—"]);
+    produccion.push(["Proceso", r.l5_proceso || "—"]);
+    produccion.push(["Kg ingresados", fmtNum(m.l5Ing)]);
+    produccion.push(["Kg aprobados", fmtNum(m.l5Apr)]);
   }
   if (activaEnvasadora) {
-    const m = computeEnvasadoMetrics(r);
+    const m = mEnv;
     const mat = r.envasadora_sku ? skuMaterial(r.envasadora_sku) : null;
-    produccion.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
+    produccion.push(["#", "Envasadora"]);
+    produccion.push(["Cumplimiento", fmtPct(m.cumplimiento)]);
+    produccion.push(["SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
     produccion.push(["Cajas producidas", fmtNum(r.cajasProducidas || 0)]);
     produccion.push(["Cajas programadas", fmtNum(r.cajasProgramadas || 0)]);
     produccion.push(["Cajas teóricas consumo", fmtNum(r.cajasTeoricas || 0)]);
     produccion.push(["Cajas consumidas real", fmtNum(r.cajasConsumidasReal || 0)]);
     produccion.push(["Bolsas teóricas consumo", fmtNum(r.bolsasTeoricas || 0)]);
     produccion.push(["Bolsas consumidas real", fmtNum(r.bolsasConsumidasReal || 0)]);
-    produccion.push(["Cumplimiento", fmtPct(m.cumplimiento)]);
     produccion.push(["Merma cajas", fmtPct(m.mermaCajas)]);
     produccion.push(["Merma bolsas", fmtPct(m.mermaBolsas)]);
 
@@ -6276,6 +6354,16 @@ const AREAS = {
           label: t.label.replace(/\s*\(.*\)/, ""),
           color: SERIES_COLORS[i % SERIES_COLORS.length],
           compute: (r) => palletsValue(r, "lavados", t),
+        })),
+      },
+      {
+        title: "Pallets pendientes por lavar al cierre (día x turno)",
+        format: "number",
+        series: TIPOS_BANDEJA.map((t, i) => ({
+          key: `pend_${t.key}`,
+          label: t.label.replace(/\s*\(.*\)/, ""),
+          color: SERIES_COLORS[i % SERIES_COLORS.length],
+          compute: (r) => num(r[`pendientes_${t.key}_pallets`]),
         })),
       },
     ],
@@ -6344,6 +6432,8 @@ const AREAS = {
       ...(r.activa_envasadora !== "Sí" && r.activa_linea5 !== "Sí" ? [["Líneas de trabajo", "Ninguna activa"]] : []),
       ["Total dotación", fmtNum(dotacionEnvasadoTotal(r))],
       ["¿Dotación completa?", r.dotacionCompleta || "—"],
+      ...materialesMtcSkuLines(r.mtcCajasSkuInicio, "Cajas").map(([l, v]) => [l.replace("Material · ", ""), v]),
+      ...materialesMtcSkuLines(r.mtcBolsasSkuInicio, "Bolsas").map(([l, v]) => [l.replace("Material · ", ""), v]),
     ],
     resumenCompletoInicio: resumenEnvasadoInicioCompleto,
     resumenCompletoCierre: resumenEnvasadoCierreCompleto,
@@ -6405,7 +6495,16 @@ function InicioTab({ area, values, setField, editingId, onSaved, onCancelEdit, a
       claveTurno: claveTurno(values.fecha, values.turno),
       responsable: autor || "Sin nombre",
     };
-    const updated = editingId ? records.map((r) => (r.id === editingId ? record : r)) : [...records, record];
+    // Un solo inicio por turno: si ya existe uno de esta fecha y turno (p. ej. por
+    // reintentar un guardado que dio error de sincronización), se actualiza ese
+    // en vez de agregar un duplicado.
+    const existente = editingId ? null : masRecientePorClave(records, record.claveTurno);
+    if (existente) record.id = existente.id;
+    const updated = editingId
+      ? records.map((r) => (r.id === editingId ? record : r))
+      : existente
+        ? records.filter((r) => r.claveTurno !== record.claveTurno).concat(record)
+        : [...records, record];
     const ok = await saveRecords(updated);
     // El registro ya quedó guardado en este dispositivo aunque falle la sincronización con
     // Sheets, así que el botón de WhatsApp se ofrece igual.
@@ -6493,12 +6592,12 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
 
   const loading = loadingI || loadingC;
   const clave = claveTurno(fecha, turno);
-  const inicio = inicioRecords.find((r) => r.claveTurno === clave);
-  const cierreActual = cierreRecords.find((r) => r.claveTurno === clave);
+  const inicio = masRecientePorClave(inicioRecords, clave) || undefined;
+  const cierreActual = masRecientePorClave(cierreRecords, clave) || undefined;
 
   useEffect(() => {
     if (loading) return;
-    const found = cierreRecords.find((r) => r.claveTurno === clave);
+    const found = masRecientePorClave(cierreRecords, clave);
     setValues(found ? { ...found } : {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clave, loading]);
@@ -6521,7 +6620,8 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
       estado: "Enviado",
       fechaHoraCierre: new Date().toISOString(),
     };
-    const updated = cierreActual ? cierreRecords.map((r) => (r.id === cierreActual.id ? record : r)) : [...cierreRecords, record];
+    // Un solo cierre por turno: se reemplaza el existente (y cualquier duplicado de reintentos).
+    const updated = cierreActual ? cierreRecords.filter((r) => r.claveTurno !== clave).concat(record) : [...cierreRecords, record];
     const ok = await saveCierres(updated);
     setValues(record);
     if (ok) {
@@ -6602,7 +6702,7 @@ function IndicadoresTab({ area }) {
   const charts = area.detailCharts || [];
 
   const sorted = [...cierreRecords].sort((a, b) => a.id - b.id).slice(-7);
-  const merged = sorted.map((c) => ({ ...(inicioRecords.find((r) => r.claveTurno === c.claveTurno) || {}), ...c }));
+  const merged = sorted.map((c) => ({ ...(masRecientePorClave(inicioRecords, c.claveTurno) || {}), ...c }));
 
   return (
     <div className="space-y-4">
@@ -6930,11 +7030,21 @@ function seguridadPorSupervisor(datos, desde, hasta) {
   };
 }
 
+const TODOS_LOS_TURNOS = ["T1", "T2", "T3"];
+
+// Filtra por turno los registros de las 3 áreas y el programa (filtro general del dashboard).
+function filtrarDatosPorTurno(datos, turnos) {
+  if (turnos.length >= TODOS_LOS_TURNOS.length) return datos;
+  const ok = (r) => turnos.includes(r.turno);
+  const area = (a) => ({ ...a, inicio: a.inicio.filter(ok), cierres: a.cierres.filter(ok) });
+  return { ...datos, lavado: area(datos.lavado), seleccion: area(datos.seleccion), envasado: area(datos.envasado), programas: datos.programas.filter(ok) };
+}
+
 // Calcula TODOS los indicadores de un período (cierres con su inicio fusionado).
-function resumenPeriodo(datos, desde, hasta) {
+function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   const { lavado, seleccion, envasado, programas, horarios } = datos;
   const enRango = (r) => r.fecha && r.fecha >= desde && r.fecha <= hasta;
-  const fusionados = (a) => a.cierres.filter(enRango).map((c) => ({ ...(a.inicio.find((i) => i.claveTurno === c.claveTurno) || {}), ...c }));
+  const fusionados = (a) => a.cierres.filter(enRango).map((c) => ({ ...(masRecientePorClave(a.inicio, c.claveTurno) || {}), ...c }));
   const progDe = (c) => programas.filter((p) => p.fecha === c.fecha && p.turno === c.turno);
   const hoy = today();
   const sinCierre = (a) => a.inicio.filter((i) => enRango(i) && i.fecha < hoy && !a.cierres.some((c) => c.claveTurno === i.claveTurno)).length;
@@ -6946,6 +7056,42 @@ function resumenPeriodo(datos, desde, hasta) {
     .map((t) => ({ key: t.key, label: t.label.replace(/\s*\(.*\)/, ""), valor: sumaPor(lav, (r) => palletsValue(r, "lavados", t)) }))
     .filter((t) => t.valor > 0);
   const lavDiario = serieDiaria(lav, desde, hasta, (r) => totalPalletsFromPrefix(r, "lavados"));
+  // Pallets lavados por día, separados por tipo de bandeja (barras apiladas).
+  const nombreTipo = (t) => t.label.replace(/\s*\(.*\)/, "");
+  const lavColores = {};
+  TIPOS_BANDEJA.forEach((t, i) => { lavColores[nombreTipo(t)] = SERIES_COLORS[i % SERIES_COLORS.length]; });
+  const lavTiposKeys = lavTipos.map((t) => t.label);
+  const lavDiarioTipos = [];
+  for (let f = desde; f <= hasta; f = sumarDias(f, 1)) {
+    const rs = lav.filter((r) => r.fecha === f);
+    const fila = { label: fmtCorto(f) };
+    TIPOS_BANDEJA.forEach((t) => { fila[nombreTipo(t)] = Math.round(sumaPor(rs, (r) => palletsValue(r, "lavados", t)) * 10) / 10; });
+    lavDiarioTipos.push(fila);
+  }
+  // Pallets pendientes por lavar que quedaron al cierre de cada turno.
+  const rangoTurno = { T3: 0, T1: 1, T2: 2 };
+  const lavOrden = [...lav].sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)) || (rangoTurno[a.turno] ?? 9) - (rangoTurno[b.turno] ?? 9) || (a.id || 0) - (b.id || 0));
+  const pendDe = (c) => c ? {
+    fecha: c.fecha, turno: c.turno,
+    total: Math.round(totalPalletsManual(c, "pendientes") * 10) / 10,
+    tipos: TIPOS_BANDEJA.map((t) => ({ key: t.key, label: nombreTipo(t), valor: num(c[`pendientes_${t.key}_pallets`]) })).filter((t) => t.valor > 0),
+  } : null;
+  const ultimoPorDia = (lista) => {
+    const m = new Map();
+    lista.forEach((c) => m.set(c.fecha, c));
+    return [...m.values()];
+  };
+  const pendTotalDe = (c) => totalPalletsManual(c, "pendientes");
+  const pendientes = {
+    ult: pendDe(lavOrden[lavOrden.length - 1]),
+    porTurno: {},
+    diario: { ult: serieDiaria(ultimoPorDia(lavOrden), desde, hasta, pendTotalDe) },
+  };
+  ["T1", "T2", "T3"].forEach((tk) => {
+    const delTurno = lavOrden.filter((c) => c.turno === tk);
+    pendientes.porTurno[tk] = pendDe(delTurno[delTurno.length - 1]);
+    pendientes.diario[tk] = serieDiaria(ultimoPorDia(delTurno), desde, hasta, pendTotalDe);
+  });
 
   // ---- Selección (total y por línea) ----
   const sel = fusionados(seleccion);
@@ -7035,9 +7181,9 @@ function resumenPeriodo(datos, desde, hasta) {
     .sort((a, b) => `${b.fecha}${b.turno}`.localeCompare(`${a.fecha}${a.turno}`));
 
   return {
-    desde, hasta,
+    desde, hasta, turnosSel,
     turnosCerrados: { lavado: lav.length, seleccion: sel.length, envasado: env.length },
-    lavado: { total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario },
+    lavado: { total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
     seleccion: {
       ing: selIng, apr: selApr, prog: selProg, rend: selRend, cump: selCump, lineas: selLineas,
     },
@@ -7170,7 +7316,7 @@ function SvgApilado({ data, keys, colores, alto = 110 }) {
               acc += h;
               return <rect key={k} x={x} y={y} width={bw * 0.64} height={h} fill={colores[k]} />;
             })}
-            {totales[i] > 0 && <text x={i * bw + bw / 2} y={alto - acc - 3} textAnchor="middle" fontSize="9" fontWeight="600" fill="#334155">{totales[i]}</text>}
+            {totales[i] > 0 && <text x={i * bw + bw / 2} y={alto - acc - 3} textAnchor="middle" fontSize="9" fontWeight="600" fill="#334155">{Math.round(totales[i] * 10) / 10}</text>}
             {(n <= 14 || i % 2 === 0) && <text x={i * bw + bw / 2} y={alto + 12} textAnchor="middle" fontSize="9" fill="#64748b">{d.label}</text>}
           </g>
         );
@@ -7238,6 +7384,57 @@ function GraficoDiario({ titulo, data, formato = "num", color, svg, mitad }) {
   );
 }
 
+// Barras apiladas por día (un color por tipo de bandeja): SVG en el reporte, recharts en pantalla.
+function GraficoApiladoTipos({ titulo, data, keys, colores, svg, vacio }) {
+  const hay = data.some((d) => keys.some((k) => d[k] > 0));
+  return (
+    <div className="rep-bloque">
+      <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+      {!hay ? <EmptyNote text={vacio || "Sin datos en el período."} /> : svg ? (
+        <>
+          <SvgApilado data={data} keys={keys} colores={colores} />
+          <LeyendaSupervisores keys={keys} colores={colores} />
+        </>
+      ) : (
+        <ResponsiveContainer width="100%" height={190}>
+          <BarChart data={data} margin={{ top: 6, right: 6, left: -18, bottom: 0 }}>
+            <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" stroke="#64748b" fontSize={9} interval="preserveStartEnd" minTickGap={14} />
+            <YAxis stroke="#64748b" fontSize={10} allowDecimals={false} />
+            <Tooltip contentStyle={{ background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12, color: "#1e293b" }} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            {keys.map((k) => <Bar key={k} dataKey={k} name={k} stackId="tipos" fill={colores[k]} />)}
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+    </div>
+  );
+}
+
+// Pallets pendientes por lavar al cierre de los turnos elegidos en el filtro general.
+function PendientesLavado({ pend, turnosSel, svg }) {
+  const detalle = (d) => d.tipos.length ? d.tipos.map((t) => `${t.label}: ${fmtNum(t.valor, 1)}`).join(" · ") : "Sin pallets pendientes";
+  const lista = TODOS_LOS_TURNOS.filter((k) => turnosSel.includes(k));
+  return (
+    <div className="rep-bloque space-y-3">
+      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Pallets pendientes por lavar · último cierre del período</p>
+      <div className={`grid gap-2 ${lista.length === 1 ? "grid-cols-1" : lista.length === 2 ? "grid-cols-2" : "grid-cols-3"}`}>
+        {lista.map((tk) => {
+          const d = pend.porTurno[tk];
+          return (
+            <div key={tk} className={`rounded-xl border px-3 py-2.5 ${d ? TONO_CLASES[d.total > 0 ? "warn" : "ok"] : TONO_CLASES.none}`}>
+              <div className="text-[11px] font-medium text-slate-500">{turnoLabel(tk)}</div>
+              <div className="text-2xl font-bold text-slate-900">{d ? fmtNum(d.total, 1) : "—"}{d ? <span className="text-xs font-medium text-slate-500 ml-1">pallets</span> : null}</div>
+              <div className="text-[10px] text-slate-500">{d ? `Cierre ${fmtFecha(d.fecha)} · ${detalle(d)}` : "Sin cierres en el período"}</div>
+            </div>
+          );
+        })}
+      </div>
+      <GraficoDiario svg={svg} titulo="Pendientes al cierre por día" data={pend.diario.ult} color="#f59e0b" />
+    </div>
+  );
+}
+
 function ParetoDetenciones({ items, total }) {
   if (!items.length) return <EmptyNote text="Sin detenciones registradas en el período." />;
   const max = items[0].min;
@@ -7294,6 +7491,33 @@ function SelectorPeriodo({ modo, setModo, offset, setOffset, desde, hasta }) {
       <div className="flex rounded-lg border border-slate-300 overflow-hidden text-sm">
         {[["semana", "Semana"], ["mes", "4 semanas"]].map(([k, l]) => (
           <button key={k} onClick={() => setModo(k)} className={`px-3 py-1.5 ${modo === k ? "bg-slate-800 text-white" : "bg-white text-slate-700"}`}>{l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Filtro general de turnos: aplica a TODOS los indicadores (y al reporte PDF).
+function SelectorTurnos({ turnos, setTurnos }) {
+  const todos = turnos.length === TODOS_LOS_TURNOS.length;
+  const alternar = (k) => {
+    if (todos) { setTurnos([k]); return; } // desde «Todos», elegir un turno deja solo ese
+    if (turnos.includes(k)) { if (turnos.length > 1) setTurnos(turnos.filter((t) => t !== k)); }
+    else setTurnos(TODOS_LOS_TURNOS.filter((t) => t === k || turnos.includes(t)));
+  };
+  const clase = (on) => `px-3 py-1.5 text-sm border-l first:border-l-0 border-slate-300 ${on ? "bg-slate-800 text-white" : "bg-white text-slate-700"}`;
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-3 flex flex-wrap items-center gap-3 justify-between">
+      <div>
+        <div className="text-sm font-semibold text-slate-900">Turnos</div>
+        <div className="text-[11px] text-slate-500">Aplica a todos los indicadores</div>
+      </div>
+      <div className="flex rounded-lg border border-slate-300 overflow-hidden">
+        <button type="button" onClick={() => setTurnos(TODOS_LOS_TURNOS)} className={clase(todos)}>Todos</button>
+        {TODOS_LOS_TURNOS.map((k) => (
+          <button key={k} type="button" onClick={() => alternar(k)} className={clase(!todos && turnos.includes(k))}>
+            {turnoLabel(k)}
+          </button>
         ))}
       </div>
     </div>
@@ -7366,7 +7590,8 @@ function PanelIndicadores({ r, p, svg }) {
           <Kpi label="Turnos cerrados" valor={r.turnosCerrados.lavado} actual={r.turnosCerrados.lavado} previo={p.turnosCerrados.lavado} />
           {r.lavado.tipos.map((t) => <Kpi key={t.key} label={t.label} tipo="num1" valor={t.valor} sub="pallets" />)}
         </div>
-        <GraficoDiario svg={svg} titulo="Pallets lavados por día" data={r.lavado.diario} color="#3b82f6" />
+        <GraficoApiladoTipos svg={svg} titulo="Pallets lavados por día, según tipo de bandeja" data={r.lavado.diarioTipos} keys={r.lavado.tiposKeys} colores={r.lavado.colores} vacio="Sin pallets lavados en el período." />
+        <PendientesLavado pend={r.lavado.pendientes} turnosSel={r.turnosSel} svg={svg} />
       </SeccionArea>
 
       {/* ---------- Selección: total y una sección por línea ---------- */}
@@ -7494,25 +7719,27 @@ function JefeDashboard({ onBack }) {
   const [modo, setModo] = useState("semana");
   const [offset, setOffset] = useState(0);
   const [verReporte, setVerReporte] = useState(false);
+  const [turnos, setTurnos] = useState(TODOS_LOS_TURNOS);
 
   const loading = lavado.loading || seleccion.loading || envasado.loading || loadingP;
   const semana = semanaDe(sumarDias(today(), offset * 7));
   const dias = modo === "semana" ? 7 : 28;
   const hasta = semana.hasta;
   const desde = sumarDias(hasta, -(dias - 1));
-  const datos = { lavado, seleccion, envasado, programas, horarios };
-  const r = loading ? null : resumenPeriodo(datos, desde, hasta);
-  const p = loading ? null : resumenPeriodo(datos, sumarDias(desde, -dias), sumarDias(desde, -1));
+  const datos = filtrarDatosPorTurno({ lavado, seleccion, envasado, programas, horarios }, turnos);
+  const r = loading ? null : resumenPeriodo(datos, desde, hasta, turnos);
+  const p = loading ? null : resumenPeriodo(datos, sumarDias(desde, -dias), sumarDias(desde, -1), turnos);
 
   // El reporte siempre es de UNA semana (lunes a domingo): la semana seleccionada.
-  const rSemana = loading ? null : (dias === 7 ? r : resumenPeriodo(datos, semana.desde, semana.hasta));
-  const pSemana = loading ? null : resumenPeriodo(datos, sumarDias(semana.desde, -7), sumarDias(semana.desde, -1));
+  const rSemana = loading ? null : (dias === 7 ? r : resumenPeriodo(datos, semana.desde, semana.hasta, turnos));
+  const pSemana = loading ? null : resumenPeriodo(datos, sumarDias(semana.desde, -7), sumarDias(semana.desde, -1), turnos);
 
   return (
     <div className="w-full max-w-2xl lg:max-w-5xl mx-auto pb-10">
       <TopBar title="Indicadores generales" subtitle="Vista ejecutiva de las 3 áreas" onBack={onBack} icon={BarChart3} accent="emerald" />
       <div className="p-4 space-y-4">
         <SelectorPeriodo modo={modo} setModo={setModo} offset={offset} setOffset={setOffset} desde={desde} hasta={hasta} />
+        <SelectorTurnos turnos={turnos} setTurnos={setTurnos} />
 
         {loading ? <Card><Loader text="Calculando indicadores…" /></Card> : (
           <>
@@ -7583,6 +7810,7 @@ function ReporteSemanalModal({ r, p, onClose }) {
           </div>
           <div className="text-right">
             <div className="font-bold">Semana {fmtFecha(r.desde)} – {fmtFecha(r.hasta)}</div>
+            <div className="text-slate-300">{r.turnosSel.length === TODOS_LOS_TURNOS.length ? "Todos los turnos" : `Turnos: ${r.turnosSel.map(turnoLabel).join(", ")}`}</div>
             <div className="text-slate-300">Generado el {ahora}</div>
           </div>
         </div>
