@@ -5825,12 +5825,15 @@ function EntregaMaterialesCard({ areaKey, fecha, turno, autor, supervisoresList 
   // Busca el registro previo donde el turno anterior entregó AL turno actual
   const inicialRecord = useMemo(() => {
     if (!turnoEntrega) return null;
-    const tAnterior = TURNO_ANTERIOR[turnoEntrega];
+    // Cadena: T3(día X) → T1(X) → T2(X) → T3(X+1). Quien entregó al turno que
+    // cierra ahora es el turno anterior en esa cadena, con su fecha exacta
+    // (para T3 es el T2 del día anterior).
+    const ant = turnoAnterior(fecha, turnoEntrega);
+    if (!ant) return null;
     const candidatos = records.filter(
-      (r) => r.turnoEntrega === tAnterior &&
+      (r) => r.turnoEntrega === ant.turno &&
              r.turnoRecibe  === turnoEntrega &&
-             r.fecha >= fechaAtras(fecha, 2) &&
-             r.fecha <= fecha
+             r.fecha === ant.fecha
     );
     return [...candidatos].sort((a, b) => b.id - a.id)[0] || null;
   }, [records, turnoEntrega, fecha]);
