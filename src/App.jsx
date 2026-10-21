@@ -2705,7 +2705,7 @@ function NecesidadesDiaCard({ getMat }) {
       ingredientes: Object.entries(ingr).sort((a, b) => b[1] - a[1]),
       totCajas: filas.reduce((s, f) => s + f.cajas, 0),
       totBolsas: filas.reduce((s, f) => s + f.bolsas, 0),
-      totKg: filas.reduce((s, f) => s + f.kgProd, 0),
+      totKgIng: filas.reduce((s, f) => s + f.receta.reduce((x, r) => x + r.kg, 0), 0),
     };
   }, [programas, fecha, turnosSel, getMat]);
 
@@ -2738,7 +2738,7 @@ function NecesidadesDiaCard({ getMat }) {
           ) : (
             <div className="space-y-3">
               <div className="grid grid-cols-3 gap-2 text-center">
-                {[["Cajas", fmtNum(calc.totCajas)], ["Bolsas", fmtNum(calc.totBolsas)], ["Kg producto", fmtNum(calc.totKg, 0)]].map(([l, v]) => (
+                {[["Cajas", fmtNum(calc.totCajas)], ["Bolsas", fmtNum(calc.totBolsas)], ["Kgs Ingrediente", fmtNum(calc.totKgIng, 0)]].map(([l, v]) => (
                   <div key={l} className="border border-slate-200 rounded-xl p-2">
                     <div className="text-xs text-slate-500">{l}</div>
                     <div className="font-bold text-slate-900 text-lg">{v}</div>
@@ -2756,7 +2756,7 @@ function NecesidadesDiaCard({ getMat }) {
                   <div className="grid grid-cols-3 gap-2 mt-2 text-center text-xs">
                     <div className="bg-amber-50 rounded-lg p-1.5"><div className="text-slate-500">Cajas</div><div className="font-bold text-amber-800">{fmtNum(f.cajas)}</div></div>
                     <div className="bg-blue-50 rounded-lg p-1.5"><div className="text-slate-500">Bolsas{f.bxc ? ` (×${f.bxc})` : ""}</div><div className="font-bold text-blue-800">{f.bxc ? fmtNum(f.bolsas) : "—"}</div></div>
-                    <div className="bg-slate-50 rounded-lg p-1.5"><div className="text-slate-500">Kg producto</div><div className="font-bold text-slate-800">{f.kgCaja ? fmtNum(f.kgProd, 0) : "—"}</div></div>
+                    <div className="bg-slate-50 rounded-lg p-1.5"><div className="text-slate-500">Kgs Ingrediente</div><div className="font-bold text-slate-800">{f.kgCaja ? fmtNum(f.receta.reduce((x, r) => x + r.kg, 0), 0) : "—"}</div></div>
                   </div>
                   <div className="mt-2 text-xs text-slate-600">
                     {f.codBolsa && <div>Bolsa: <b>{f.codBolsa}</b> · {f.nomBolsa}</div>}
@@ -2779,24 +2779,6 @@ function NecesidadesDiaCard({ getMat }) {
                 </div>
               ))}
 
-              <div className="border border-blue-100 bg-blue-50 rounded-xl p-3">
-                <div className="text-xs font-semibold text-blue-800 mb-1">Total de bolsas por código</div>
-                {calc.bolsas.map((b) => (
-                  <div key={b.cod} className="flex justify-between gap-2 text-xs py-0.5"><span className="text-slate-700"><b>{b.cod}</b> {b.nom}</span><span className="font-bold text-blue-800">{fmtNum(b.total)}</span></div>
-                ))}
-              </div>
-              <div className="border border-amber-100 bg-amber-50 rounded-xl p-3">
-                <div className="text-xs font-semibold text-amber-800 mb-1">Total de cajas por código</div>
-                {calc.cajas.map((b) => (
-                  <div key={b.cod} className="flex justify-between gap-2 text-xs py-0.5"><span className="text-slate-700"><b>{b.cod}</b> {b.nom}</span><span className="font-bold text-amber-800">{fmtNum(b.total)}</span></div>
-                ))}
-              </div>
-              <div className="border border-emerald-100 bg-emerald-50 rounded-xl p-3">
-                <div className="text-xs font-semibold text-emerald-800 mb-1">Consumo de ingredientes (Kg)</div>
-                {calc.ingredientes.map(([ing, kg]) => (
-                  <div key={ing} className="flex justify-between gap-2 text-xs py-0.5"><span className="text-slate-700">{ing}</span><span className="font-bold text-emerald-800">{fmtNum(kg, 0)} Kg</span></div>
-                ))}
-              </div>
               {calc.fuera.length > 0 && (
                 <p className="text-xs text-red-600">SKU programados que ya no están en el maestro y no se calcularon: {calc.fuera.join(", ")}</p>
               )}
