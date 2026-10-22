@@ -5331,62 +5331,70 @@ function ProgramaProduccionScreen({ onBack }) {
           <Card><Loader /></Card>
         ) : (
           <>
-            <Card title="Vista general de la semana">
-              <div className="overflow-x-auto -mx-4 px-4">
-                <table className="border-collapse text-[11px]" style={{ minWidth: `${90 + slotsVista.length * 104}px` }}>
-                  <thead>
-                    <tr>
-                      <th className="sticky left-0 z-10 bg-slate-100 border border-slate-300 px-2 py-1 text-left text-slate-600 min-w-[90px]">Línea</th>
-                      {slotsVista.map((s, i) => (
-                        <th key={i} className="border border-slate-300 px-2 py-1 text-center min-w-[104px]">
-                          <div className="text-slate-800 font-semibold">{diaCorto(s.fecha)}</div>
-                          <div className="text-slate-600">{turnoLabel(s.turno)}</div>
-                          <div className="text-slate-500">{fmtFechaCorta(s.fecha)}</div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lineasVista.map((linea) => {
-                      const filaEntries = slotsVista.map((s) => (entriesPorSlot[slotKey(s)] || []).filter((e) => e.lineaKey === linea.key));
-                      const metas = filaEntries.map((es) => es.filter((e) => e.especie !== "LAVADO").reduce((sum, e) => sum + num(e.cantidad), 0));
-                      const cc = PROGRAMA_COLOR_CLASSES[linea.color] || PROGRAMA_COLOR_CLASSES.slate;
-                      return (
-                        <React.Fragment key={linea.key}>
-                          <tr>
-                            <td className={`sticky left-0 z-10 ${cc.meta} border border-slate-300 px-2 py-1 font-semibold`}>META ({linea.unidad})</td>
-                            {metas.map((m, i) => (
-                              <td key={i} className={`${cc.metaCell} border border-slate-300 px-2 py-1 text-center`}>
-                                {m > 0 ? fmtNum(m) : "—"}
-                              </td>
-                            ))}
-                          </tr>
-                          <tr>
-                            <td className={`sticky left-0 z-10 ${cc.label} border border-slate-300 px-2 py-1 font-semibold`}>{linea.label}</td>
-                            {filaEntries.map((es, i) => (
-                              <td key={i} className={`${cc.cell} border border-slate-300 px-1 py-1 align-top`}>
-                                {es.length === 0 ? (
-                                  <span className="text-slate-400">—</span>
-                                ) : (
-                                  es.map((e) => (
-                                    e.especie === "LAVADO" ? (
-                                      <div key={e.id} className="bg-yellow-400 text-slate-900 font-bold rounded px-1 mb-0.5 text-center">LAVADO</div>
-                                    ) : (
-                                      <div key={e.id} className="text-slate-800 mb-0.5 leading-tight">{procesoDisplay(e)} · {fmtNum(num(e.cantidad))} {e.unidad}</div>
-                                    )
-                                  ))
-                                )}
-                              </td>
-                            ))}
-                          </tr>
-                        </React.Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-              <p className="text-xs text-slate-500 mt-2">Mostrando {slotsVista.length} de 21 turnos de la semana (Lunes a Domingo, T3/T1/T2) — ajusta arriba en "¿Con cuántos turnos se está trabajando?" — y {lineasVista.length} de {programaLineas.length} líneas (solo las que tienen entradas programadas en los turnos visibles). Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
-            </Card>
+            {[{ cat: "seleccion", titulo: "Selección" }, { cat: "envasado", titulo: "Envasado" }].map(({ cat, titulo }) => {
+              // Una vista por área: Selección (L1, L3, L4, L6) y Envasado (Línea 5 y Envasadora).
+              const lineasDeCat = programaLineas.filter((l) => CATEGORIA_INSUMO_POR_LINEA[l.key] === cat);
+              const lineasConEnt = lineasDeCat.filter((l) => lineasVista.some((x) => x.key === l.key) && slotsVista.some((s) => (entriesPorSlot[slotKey(s)] || []).some((e) => e.lineaKey === l.key)));
+              const lineasSec = lineasConEnt.length > 0 ? lineasConEnt : lineasDeCat;
+              return (
+              <Card key={cat} title={`Vista general de la semana · ${titulo}`}>
+                <div className="overflow-x-auto -mx-4 px-4">
+                  <table className="border-collapse text-[11px]" style={{ minWidth: `${90 + slotsVista.length * 104}px` }}>
+                    <thead>
+                      <tr>
+                        <th className="sticky left-0 z-10 bg-slate-100 border border-slate-300 px-2 py-1 text-left text-slate-600 min-w-[90px]">Línea</th>
+                        {slotsVista.map((s, i) => (
+                          <th key={i} className="border border-slate-300 px-2 py-1 text-center min-w-[104px]">
+                            <div className="text-slate-800 font-semibold">{diaCorto(s.fecha)}</div>
+                            <div className="text-slate-600">{turnoLabel(s.turno)}</div>
+                            <div className="text-slate-500">{fmtFechaCorta(s.fecha)}</div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lineasSec.map((linea) => {
+                        const filaEntries = slotsVista.map((s) => (entriesPorSlot[slotKey(s)] || []).filter((e) => e.lineaKey === linea.key));
+                        const metas = filaEntries.map((es) => es.filter((e) => e.especie !== "LAVADO").reduce((sum, e) => sum + num(e.cantidad), 0));
+                        const cc = PROGRAMA_COLOR_CLASSES[linea.color] || PROGRAMA_COLOR_CLASSES.slate;
+                        return (
+                          <React.Fragment key={linea.key}>
+                            <tr>
+                              <td className={`sticky left-0 z-10 ${cc.meta} border border-slate-300 px-2 py-1 font-semibold`}>META ({linea.unidad})</td>
+                              {metas.map((m, i) => (
+                                <td key={i} className={`${cc.metaCell} border border-slate-300 px-2 py-1 text-center`}>
+                                  {m > 0 ? fmtNum(m) : "—"}
+                                </td>
+                              ))}
+                            </tr>
+                            <tr>
+                              <td className={`sticky left-0 z-10 ${cc.label} border border-slate-300 px-2 py-1 font-semibold`}>{linea.label}</td>
+                              {filaEntries.map((es, i) => (
+                                <td key={i} className={`${cc.cell} border border-slate-300 px-1 py-1 align-top`}>
+                                  {es.length === 0 ? (
+                                    <span className="text-slate-400">—</span>
+                                  ) : (
+                                    es.map((e) => (
+                                      e.especie === "LAVADO" ? (
+                                        <div key={e.id} className="bg-yellow-400 text-slate-900 font-bold rounded px-1 mb-0.5 text-center">LAVADO</div>
+                                      ) : (
+                                        <div key={e.id} className="text-slate-800 mb-0.5 leading-tight">{procesoDisplay(e)} · {fmtNum(num(e.cantidad))} {e.unidad}</div>
+                                      )
+                                    ))
+                                  )}
+                                </td>
+                              ))}
+                            </tr>
+                          </React.Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-xs text-slate-500 mt-2">Mostrando {slotsVista.length} de 21 turnos de la semana (Lunes a Domingo, T3/T1/T2) — ajusta arriba en "¿Con cuántos turnos se está trabajando?" — y {lineasSec.length} de {lineasDeCat.length} líneas de {titulo} (solo las que tienen entradas programadas en los turnos visibles). Las celdas en amarillo indican que esa línea está en LAVADO durante ese turno.</p>
+              </Card>
+              );
+            })}
 
             {/* Observaciones por turno — tabla separada del schedule, no ocupa celdas de la grilla */}
             <Card title="Agregar entrada al programa" step={2}>
