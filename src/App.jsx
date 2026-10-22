@@ -227,7 +227,7 @@ const SHARED_TTL_MS = 20000; // 20 segundos
 // las arma leyendo/combinando otras pestañas (SKU y Procesos del Sheet), así
 // que quedan fuera del pedido agrupado de abajo y siguen pidiéndose una por
 // una con window.storage.get.
-const CLAVES_NO_AGRUPABLES = new Set(["sku-nuevos", "procesos-extra"]);
+const CLAVES_NO_AGRUPABLES = new Set(["sku-nuevos", "procesos-extra", "factores-bandeja"]);
 
 // Agrupa en UNA sola petición HTTP todas las claves compartidas que varios
 // componentes piden "al mismo tiempo" (mismo ciclo de eventos) — por ejemplo
@@ -682,6 +682,9 @@ function stockInsumosEnvasado(stockCrudo) {
 // Tipos de bandeja / pallet para Lavado de Bandejas, con el factor
 // "bandejas por pallet" usado para calcular Cantidad de Pallets a partir
 // de Cantidad de Bandejas. factor = 0 => se ingresa manualmente.
+// Los factores se pueden cambiar desde la pestaña "Conversión Bandejas (Base de
+// Datos)" del Google Sheet (se aplican en App() al cargar). `factorBase` es el
+// valor de respaldo si el Sheet no trae uno válido para ese tipo.
 const TIPOS_BANDEJA = [
   { key: "b641", label: "Bandejas 641 (Bandeja Azul)", factor: 230 },
   { key: "b057", label: "Bandejas 057 (Bandeja Verde)", factor: 250 },
@@ -690,7 +693,7 @@ const TIPOS_BANDEJA = [
   { key: "b053", label: "Bandejas 053 (Bandeja 3/4)", factor: 55 },
   { key: "totes", label: "Totes", factor: 80 },
   { key: "bins", label: "Bins", factor: 1 },
-];
+].map((t) => ({ ...t, factorBase: t.factor }));
 
 // Materiales de piso de planta (Selección y Envasado)
 const MATERIALES_SELECCION = [
@@ -4603,10 +4606,28 @@ function dotacionEnvasadoTotal(values) {
   return t;
 }
 
+// Consumo TEÓRICO de la Envasadora = lo que se debía consumir para las cajas
+// realmente PRODUCIDAS (1 caja por caja + bolsas por caja del SKU). Antes se
+// calculaba con las cajas programadas, lo que mezclaba el incumplimiento del
+// programa con la merma. Se recalcula siempre desde las cajas producidas, así
+// también quedan corregidos los registros antiguos.
+function teoricosEnvasado(v) {
+  const cajasT = num(v.cajasProducidas);
+  const mat = v.envasadora_sku ? skuMaterial(v.envasadora_sku) : null;
+  let bxc = mat ? num(mat.bolsasXCaja) : 0;
+  // Respaldo (SKU con bolsas/caja editadas por el Jefe o ya fuera del maestro):
+  // la proporción guardada en el registro (bolsas teóricas / cajas teóricas).
+  if (!bxc && num(v.cajasTeoricas) > 0) bxc = num(v.bolsasTeoricas) / num(v.cajasTeoricas);
+  return { cajasT, bolsasT: cajasT * bxc, bxc };
+}
+
 function computeEnvasadoMetrics(values) {
   const cumplimiento = num(values.cajasProgramadas) ? num(values.cajasProducidas) / num(values.cajasProgramadas) : 0;
-  const mermaCajas = num(values.cajasTeoricas) ? (num(values.cajasConsumidasReal) - num(values.cajasTeoricas)) / num(values.cajasTeoricas) : 0;
-  const mermaBolsas = num(values.bolsasTeoricas) ? (num(values.bolsasConsumidasReal) - num(values.bolsasTeoricas)) / num(values.bolsasTeoricas) : 0;
+  const teo = teoricosEnvasado(values);
+  // Merma = (consumo real − consumo teórico) / consumo teórico. Positivo = se
+  // consumió más de lo que correspondía a lo producido.
+  const mermaCajas = teo.cajasT ? (num(values.cajasConsumidasReal) - teo.cajasT) / teo.cajasT : 0;
+  const mermaBolsas = teo.bolsasT ? (num(values.bolsasConsumidasReal) - teo.bolsasT) / teo.bolsasT : 0;
   // Línea 5 ahora usa el mismo esquema que las líneas de Selección (Kg
   // ingresados + hasta 3 tipos de "Kg aprobados"). Si el registro es antiguo
   // y no tiene datos en ese esquema, cae de vuelta a los campos legacy
@@ -4759,10 +4780,10 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
   const matSku = values.envasadora_sku ? skuMaterial(values.envasadora_sku) : null;
   const bolsasXCaja = matSku ? num(matSku.bolsasXCaja) : 0;
 
-  // "Teórico" = lo que el Programa planificó para este SKU/turno (no lo realmente producido).
-  // Así el cierre puede comparar Programado (teórico) vs. Real (lo que efectivamente se produjo/consumió).
-  const cajasTeoricasCalc  = cajasProgramadasCalc;
-  const bolsasTeoricasCalc = cajasProgramadasCalc * bolsasXCaja;
+  // "Teórico" = lo que se debía consumir para las cajas realmente PRODUCIDAS
+  // (no lo programado), para que la merma mida solo el consumo de más/menos.
+  const cajasTeoricasCalc  = num(values.cajasProducidas);
+  const bolsasTeoricasCalc = num(values.cajasProducidas) * bolsasXCaja;
 
   // Sincroniza los campos calculados con el registro cada vez que cambian sus insumos,
   // para que queden guardados en el cierre (el supervisor puede seguir ajustándolos a mano).
@@ -4904,15 +4925,17 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
               </p>
             </div>
             <div>
-              <NumField label="Cajas teóricas consumo" value={values.cajasTeoricas} onChange={(v) => setField("cajasTeoricas", v)} />
-              <p className="text-xs text-slate-500 mt-1">Calculado automático = Cajas programadas para este SKU ({cajasTeoricasCalc}).</p>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Cajas teóricas consumo</label>
+              <div className="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-slate-800">{fmtNum(cajasTeoricasCalc)}</div>
+              <p className="text-xs text-slate-500 mt-1">Calculado automático = Cajas producidas ({fmtNum(cajasTeoricasCalc)}).</p>
             </div>
             <NumField label="Cajas consumidas real" value={values.cajasConsumidasReal} onChange={(v) => setField("cajasConsumidasReal", v)} />
             <div>
-              <NumField label="Bolsas teóricas consumo" value={values.bolsasTeoricas} onChange={(v) => setField("bolsasTeoricas", v)} />
+              <label className="block text-xs font-medium text-slate-600 mb-1">Bolsas teóricas consumo</label>
+              <div className="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-slate-800">{fmtNum(bolsasTeoricasCalc)}</div>
               <p className="text-xs text-slate-500 mt-1">
                 {bolsasXCaja > 0
-                  ? `Calculado automático = Cajas programadas × ${bolsasXCaja} bolsas/caja (${bolsasTeoricasCalc}).`
+                  ? `Calculado automático = Cajas producidas × ${bolsasXCaja} bolsas/caja (${fmtNum(bolsasTeoricasCalc)}).`
                   : "Selecciona un SKU con bolsas/caja definidas para calcularlo automático."}
               </p>
             </div>
@@ -6243,9 +6266,9 @@ function resumenEnvasadoCierreCompleto(r, inicio, programaEntries, horarios) {
     produccion.push(["SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
     produccion.push(["Cajas producidas", fmtNum(r.cajasProducidas || 0)]);
     produccion.push(["Cajas programadas", fmtNum(r.cajasProgramadas || 0)]);
-    produccion.push(["Cajas teóricas consumo", fmtNum(r.cajasTeoricas || 0)]);
+    produccion.push(["Cajas teóricas consumo", fmtNum(teoricosEnvasado(r).cajasT)]);
     produccion.push(["Cajas consumidas real", fmtNum(r.cajasConsumidasReal || 0)]);
-    produccion.push(["Bolsas teóricas consumo", fmtNum(r.bolsasTeoricas || 0)]);
+    produccion.push(["Bolsas teóricas consumo", fmtNum(teoricosEnvasado(r).bolsasT)]);
     produccion.push(["Bolsas consumidas real", fmtNum(r.bolsasConsumidasReal || 0)]);
     produccion.push(["Merma cajas", fmtPct(m.mermaCajas)]);
     produccion.push(["Merma bolsas", fmtPct(m.mermaBolsas)]);
@@ -7112,8 +7135,9 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
     });
     if (c.activa_envasadora === "Sí") {
       cajasProd += num(c.cajasProducidas); cajasProg += num(c.cajasProgramadas);
-      cajasTeor += num(c.cajasTeoricas); cajasReal += num(c.cajasConsumidasReal);
-      bolsasTeor += num(c.bolsasTeoricas); bolsasReal += num(c.bolsasConsumidasReal);
+      const teoC = teoricosEnvasado(c);
+      cajasTeor += teoC.cajasT; cajasReal += num(c.cajasConsumidasReal);
+      bolsasTeor += teoC.bolsasT; bolsasReal += num(c.bolsasConsumidasReal);
       const te = computeTiempoEfectivoEnvasado(c, horarios);
       if (te.tiempoEfectivo) { teTotal += te.tiempoEfectivo; bolsasConTE += num(c.bolsasConsumidasReal); }
     }
@@ -8148,6 +8172,13 @@ export default function App() {
   // ya los vean disponibles en este mismo render.
   const [skuNuevos] = useSharedList("sku-nuevos");
   SKU_NUEVOS = skuNuevos || [];
+  // Conversión "bandejas por pallet" editable desde el Google Sheet.
+  const [factoresBandeja] = useSharedList("factores-bandeja");
+  TIPOS_BANDEJA.forEach((t) => {
+    const o = (Array.isArray(factoresBandeja) ? factoresBandeja : []).find((x) => x && x.key === t.key);
+    const f = o ? Number(o.factor) : NaN;
+    t.factor = Number.isFinite(f) && f > 0 ? f : t.factorBase;
+  });
 
   // A qué pantalla volver según dónde estamos
   const backTarget = (s) => {
