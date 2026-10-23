@@ -7287,7 +7287,9 @@ function seguridadPorSupervisor(datos, desde, hasta) {
   const enPeriodo = casos.filter((c) => c.fecha >= desde && c.fecha <= hasta);
   const enSemanas = casos.filter((c) => c.fecha >= semanas[0].desde && c.fecha <= semanas[semanas.length - 1].hasta);
   const enMeses = casos.filter((c) => meses.some((m) => c.fecha.startsWith(m.key)));
-  const nombres = [...new Set([...enPeriodo, ...enSemanas, ...enMeses].map((c) => c.sup))];
+  // Todos los supervisores registrados (aunque tengan 0 casos) + los que aparecen en cierres.
+  const registrados = (datos.supervisoresLista || []).map((s) => String(s.nombre || "").trim()).filter(Boolean);
+  const nombres = [...new Set([...registrados, ...enPeriodo, ...enSemanas, ...enMeses].map((c) => (typeof c === "string" ? c : c.sup)))];
   const total = (s) => casos.filter((c) => c.sup === s && (
     (c.fecha >= desde && c.fecha <= hasta) || (c.fecha >= semanas[0].desde && c.fecha <= semanas[7].hasta) || c.fecha.startsWith(mesActual)
   )).length;
@@ -8106,6 +8108,7 @@ function JefeDashboard({ onBack }) {
   const seleccion = useAreaCierres("seleccion");
   const envasado = useAreaCierres("envasado");
   const [programas, , loadingP] = useSharedList("programa-records");
+  const [supervisoresReg] = useSupervisores();
   const { horarios } = useHorariosTurno();
   const [modo, setModo] = useState("semana");
   const [offset, setOffset] = useState(0);
@@ -8117,7 +8120,7 @@ function JefeDashboard({ onBack }) {
   const dias = modo === "semana" ? 7 : 28;
   const hasta = semana.hasta;
   const desde = sumarDias(hasta, -(dias - 1));
-  const datos = filtrarDatosPorTurno({ lavado, seleccion, envasado, programas, horarios }, turnos);
+  const datos = filtrarDatosPorTurno({ lavado, seleccion, envasado, programas, horarios, supervisoresLista: supervisoresReg || [] }, turnos);
   const r = loading ? null : resumenPeriodo(datos, desde, hasta, turnos);
   const p = loading ? null : resumenPeriodo(datos, sumarDias(desde, -dias), sumarDias(desde, -1), turnos);
 
