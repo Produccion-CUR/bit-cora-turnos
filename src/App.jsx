@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
+  LineChart, Line, ReferenceLine,
 } from "recharts";
 
 // ---------------------------------------------------------------------------
@@ -916,6 +917,203 @@ function lineaKgTotales(values, linea) {
     apr += kgAprobadoTotal(values, linea.key, s);
   });
   return { ing, apr };
+}
+
+// Procesos extra (agregados por el Jefe) disponibles para traducir proceso → especie
+// en indicadores; se llena en App() igual que SKU_NUEVOS.
+let PROCESOS_EXTRA_MOD = [];
+function especieDeProceso(lineaKey, proceso) {
+  const l = LINEAS_SELECCION.find((x) => x.key === lineaKey);
+  const base = l ? l.procesos.find(([p]) => p === proceso) : null;
+  if (base) return base[1];
+  const extra = PROCESOS_EXTRA_MOD.find((p) => p.lineaKey === lineaKey && p.proceso === proceso);
+  if (extra) return extra.especie;
+  const cualquiera = LINEAS_SELECCION.flatMap((x) => x.procesos).find(([p]) => p === proceso);
+  return cualquiera ? cualquiera[1] : "—";
+}
+
+// Kg ingresados/aprobados de UN registro de Selección, separados por línea +
+// proceso (+ especie del proceso). Usa el proceso elegido en el Inicio de
+// turno para cada slot de especie. Solo líneas activas y especies no quitadas.
+function kgPorProcesoEspecie(r) {
+  const out = [];
+  LINEAS_SELECCION.forEach((l) => {
+    if (r[`linea_${l.key}_activa`] !== "Sí") return;
+    ESPECIE_SLOTS.forEach((s) => {
+      if (r[`quitada_${l.key}_e${s}`]) return;
+      const proceso = r[`linea_${l.key}_proceso${sufijoEspecie(s)}`] || "";
+      const ing = num(r[`kg_${l.key}_e${s}_ing`]);
+      const apr = kgAprobadoTotal(r, l.key, s);
+      if (!proceso || (!ing && !apr)) return;
+      out.push({ lineaKey: l.key, linea: l.label, proceso, especie: especieDeProceso(l.key, proceso), ing, apr });
+    });
+  });
+  return out;
+}
+
+// Suma varios registros: una fila por especie + proceso.
+function agruparProcesoEspecie(registros) {
+  const m = {};
+  registros.forEach((r) => kgPorProcesoEspecie(r).forEach((x) => {
+    const k = `${x.especie}||${x.proceso}`;
+    m[k] = m[k] || { especie: x.especie, proceso: x.proceso, ing: 0, apr: 0, lineas: new Set() };
+    m[k].ing += x.ing; m[k].apr += x.apr; m[k].lineas.add(x.linea);
+  }));
+  return Object.values(m)
+    .map((x) => ({ ...x, lineas: [...x.lineas].sort().join(", ") }))
+    .sort((a, b) => a.especie.localeCompare(b.especie) || b.ing - a.ing);
+}
+
+// Mermas de Envasadora asociadas al SKU producido (una fila por SKU).
+function mermaPorSku(registros) {
+  const m = {};
+  registros.forEach((r) => {
+    if (r.activa_envasadora !== "Sí" || !r.envasadora_sku) return;
+    const t = teoricosEnvasado(r);
+    const x = (m[r.envasadora_sku] = m[r.envasadora_sku] || { sku: r.envasadora_sku, turnos: 0, cajasProd: 0, cajasProg: 0, cajasReal: 0, cajasTeo: 0, bolsasReal: 0, bolsasTeo: 0 });
+    x.turnos += 1; x.cajasProd += num(r.cajasProducidas); x.cajasProg += num(r.cajasProgramadas);
+    x.cajasReal += num(r.cajasConsumidasReal); x.cajasTeo += t.cajasT;
+    x.bolsasReal += num(r.bolsasConsumidasReal); x.bolsasTeo += t.bolsasT;
+  });
+  return Object.values(m).map((x) => ({
+    ...x,
+    producto: skuMaterial(x.sku)?.producto || x.sku,
+    cumplimiento: x.cajasProg ? x.cajasProd / x.cajasProg : null,
+    mermaCajas: x.cajasTeo ? (x.cajasReal - x.cajasTeo) / x.cajasTeo : null,
+    mermaBolsas: x.bolsasTeo ? (x.bolsasReal - x.bolsasTeo) / x.bolsasTeo : null,
+  })).sort((a, b) => b.cajasProd - a.cajasProd);
+}
+
+function TablaProcesoEspecie({ rows }) {
+  if (!rows.length) return <EmptyNote text="Sin Kg ingresados por proceso en el período." />;
+  const porEsp = [];
+  rows.forEach((x) => {
+    let g = porEsp.find((e) => e.especie === x.especie);
+    if (!g) { g = { especie: x.especie, ing: 0, apr: 0, procesos: [] }; porEsp.push(g); }
+    g.ing += x.ing; g.apr += x.apr; g.procesos.push(x);
+  });
+  const tot = rows.reduce((a, x) => ({ ing: a.ing + x.ing, apr: a.apr + x.apr }), { ing: 0, apr: 0 });
+  return (
+    <div className="rep-bloque overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-left text-slate-500 border-b border-slate-200">
+            <th className="py-1 font-medium">Especie / Proceso</th>
+            <th className="py-1 font-medium text-right">Kg ingresados</th>
+            <th className="py-1 font-medium text-right">Kg aprobados</th>
+            <th className="py-1 font-medium text-right">Rend.</th>
+          </tr>
+        </thead>
+        <tbody>
+          {porEsp.map((g) => (
+            <React.Fragment key={g.especie}>
+              <tr className="bg-violet-50 font-semibold text-slate-800">
+                <td className="py-1 px-1">{g.especie}</td>
+                <td className="text-right">{fmtNum(g.ing)}</td>
+                <td className="text-right">{fmtNum(g.apr)}</td>
+                <td className="text-right">{g.ing ? fmtPct(g.apr / g.ing) : "—"}</td>
+              </tr>
+              {g.procesos.map((x) => (
+                <tr key={x.proceso} className="border-b border-slate-100 text-slate-700">
+                  <td className="py-0.5 pl-3">{x.proceso}<span className="text-slate-400"> · {x.lineas}</span></td>
+                  <td className="text-right">{fmtNum(x.ing)}</td>
+                  <td className="text-right">{fmtNum(x.apr)}</td>
+                  <td className="text-right">{x.ing ? fmtPct(x.apr / x.ing) : "—"}</td>
+                </tr>
+              ))}
+            </React.Fragment>
+          ))}
+          <tr className="font-bold text-slate-900 border-t border-slate-300">
+            <td className="py-1">Total</td>
+            <td className="text-right">{fmtNum(tot.ing)}</td>
+            <td className="text-right">{fmtNum(tot.apr)}</td>
+            <td className="text-right">{tot.ing ? fmtPct(tot.apr / tot.ing) : "—"}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// Pallets lavados por tipo de bandeja: una fila por tipo con bandejas, factor y pallets.
+function agruparLavadoTipos(registros) {
+  const rows = TIPOS_BANDEJA.map((t) => ({
+    key: t.key, label: t.label, factor: t.factor,
+    bandejas: registros.reduce((a, r) => a + num(r[`lavados_${t.key}_cant`]), 0),
+    pallets: registros.reduce((a, r) => a + palletsValue(r, "lavados", t), 0),
+  })).filter((x) => x.pallets > 0 || x.bandejas > 0);
+  const tot = rows.reduce((a, x) => a + x.pallets, 0);
+  return rows.map((x) => ({ ...x, pct: tot ? x.pallets / tot : 0 })).sort((a, b) => b.pallets - a.pallets);
+}
+
+function TablaLavadoTipos({ rows }) {
+  if (!rows.length) return <EmptyNote text="Sin pallets lavados en el período." />;
+  const tot = rows.reduce((a, x) => ({ b: a.b + x.bandejas, p: a.p + x.pallets }), { b: 0, p: 0 });
+  return (
+    <div className="rep-bloque overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-left text-slate-500 border-b border-slate-200">
+            <th className="py-1 font-medium">Tipo de bandeja</th>
+            <th className="py-1 font-medium text-right">Bandejas</th>
+            <th className="py-1 font-medium text-right">Band./pallet</th>
+            <th className="py-1 font-medium text-right">Pallets</th>
+            <th className="py-1 font-medium text-right">%</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((x) => (
+            <tr key={x.key} className="border-b border-slate-100 text-slate-700">
+              <td className="py-1 text-slate-800">{x.label}</td>
+              <td className="text-right">{x.bandejas ? fmtNum(x.bandejas) : "—"}</td>
+              <td className="text-right">{x.factor > 0 ? fmtNum(x.factor) : "—"}</td>
+              <td className="text-right font-semibold text-slate-800">{fmtNum(x.pallets, 1)}</td>
+              <td className="text-right">{fmtPct(x.pct)}</td>
+            </tr>
+          ))}
+          <tr className="font-bold text-slate-900 border-t border-slate-300">
+            <td className="py-1">Total</td>
+            <td className="text-right">{fmtNum(tot.b)}</td>
+            <td></td>
+            <td className="text-right">{fmtNum(tot.p, 1)}</td>
+            <td className="text-right">100%</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TablaMermaSku({ rows }) {
+  if (!rows.length) return <EmptyNote text="Sin cierres de Envasadora con SKU en el período." />;
+  return (
+    <div className="rep-bloque overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-left text-slate-500 border-b border-slate-200">
+            <th className="py-1 font-medium">SKU</th>
+            <th className="py-1 font-medium text-right">Turnos</th>
+            <th className="py-1 font-medium text-right">Cajas prod.</th>
+            <th className="py-1 font-medium text-right">Cumpl.</th>
+            <th className="py-1 font-medium text-right">Merma cajas</th>
+            <th className="py-1 font-medium text-right">Merma bolsas</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((x) => (
+            <tr key={x.sku} className="border-b border-slate-100 text-slate-700">
+              <td className="py-1"><span className="font-mono font-semibold text-slate-800">{x.sku}</span><div className="text-[10px] text-slate-500 leading-tight">{x.producto}</div></td>
+              <td className="text-right">{x.turnos}</td>
+              <td className="text-right">{fmtNum(x.cajasProd)}</td>
+              <td className={`text-right font-semibold ${x.cumplimiento != null && x.cumplimiento < 0.9 ? "text-red-600" : "text-slate-800"}`}>{x.cumplimiento == null ? "—" : fmtPct(x.cumplimiento)}</td>
+              <td className={`text-right font-semibold ${x.mermaCajas > 0.02 ? "text-red-600" : "text-slate-800"}`}>{x.mermaCajas == null ? "—" : fmtPct(x.mermaCajas)}</td>
+              <td className={`text-right font-semibold ${x.mermaBolsas > 0.02 ? "text-red-600" : "text-slate-800"}`}>{x.mermaBolsas == null ? "—" : fmtPct(x.mermaBolsas)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function especiesUnicas(procesos) {
@@ -5158,6 +5356,8 @@ function ProgramaProduccionScreen({ onBack }) {
   const [fechaInicio, setFechaInicio] = useState(today());
   const [draft, setDraft] = useState({ fecha: today(), lineaKey: "", turno: "", especie: "", cantidad: "" });
   const [obsTexto, setObsTexto] = useState("");
+  // Entrada del programa que se está editando (null = agregando una nueva).
+  const [editId, setEditId] = useState(null);
   const [fechaEnvioWA, setFechaEnvioWA] = useState(today());
   const [toast, setToast] = useState(null);
   const [toastObs, setToastObs] = useState(null);
@@ -5261,7 +5461,7 @@ function ProgramaProduccionScreen({ onBack }) {
       return;
     }
     const entry = {
-      id: Date.now(),
+      id: editId ?? Date.now(),
       fecha: draft.fecha,
       lineaKey: draft.lineaKey,
       lineaLabel: lineaCfg?.label || draft.lineaKey,
@@ -5270,14 +5470,44 @@ function ProgramaProduccionScreen({ onBack }) {
       cantidad: esLavado ? 0 : num(draft.cantidad),
       unidad: lineaCfg?.unidad || "",
     };
-    const ok = await saveRecords([...records, entry]);
+    // Editando: reemplaza la entrada en su misma posición (mismo id).
+    // Lo guardado por el Sheet se actualiza igual que al agregar.
+    const nuevaLista = editId != null && records.some((r) => r.id === editId)
+      ? records.map((r) => (r.id === editId ? entry : r))
+      : [...records, entry];
+    // La última de la lista es la que se envía a la hoja legible; al editar
+    // se mueve la entrada editada al final para que quede sincronizada.
+    const ordenada = editId != null ? [...nuevaLista.filter((r) => r.id !== entry.id), entry] : nuevaLista;
+    const ok = await saveRecords(ordenada);
+    const estabaEditando = editId != null;
+    setEditId(null);
     setDraft((prev) => ({ ...prev, lineaKey: "", turno: "", especie: "", cantidad: "" }));
     setToast(ok
-      ? { kind: "ok", message: "Entrada agregada al programa." }
-      : { kind: "error", message: "No se pudo sincronizar con el almacenamiento. Vuelve a presionar Agregar." });
+      ? { kind: "ok", message: estabaEditando ? "Cambios guardados en el programa." : "Entrada agregada al programa." }
+      : { kind: "error", message: "No se pudo sincronizar con el almacenamiento. Vuelve a presionar el botón." });
+  };
+
+  // Carga una entrada ya programada en el formulario para modificarla.
+  const handleEditEntry = (e) => {
+    setEditId(e.id);
+    setDraft({
+      fecha: e.fecha, lineaKey: e.lineaKey, turno: e.turno,
+      especie: e.especie, cantidad: e.especie === "LAVADO" ? "" : String(e.cantidad ?? ""),
+    });
+    setToast(null);
+    setTimeout(() => {
+      const el = document.getElementById("programa-form");
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  };
+
+  const cancelarEdicion = () => {
+    setEditId(null);
+    setDraft((prev) => ({ ...prev, lineaKey: "", turno: "", especie: "", cantidad: "" }));
   };
 
   const handleRemove = async (id) => {
+    if (editId === id) cancelarEdicion();
     await saveRecords(records.filter((r) => r.id !== id));
   };
 
@@ -5397,7 +5627,13 @@ function ProgramaProduccionScreen({ onBack }) {
             })}
 
             {/* Observaciones por turno — tabla separada del schedule, no ocupa celdas de la grilla */}
-            <Card title="Agregar entrada al programa" step={2}>
+            <div id="programa-form" />
+            <Card title={editId != null ? "Editar entrada del programa" : "Agregar entrada al programa"} step={2}>
+              {editId != null && (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-300 rounded-lg px-3 py-1.5 mb-3">
+                  ✎ Estás editando una entrada ya programada. Cambia lo que necesites y presiona "Guardar cambios".
+                </p>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <TextField label="Fecha" type="date" value={draft.fecha} onChange={(v) => setDraftField("fecha", v)} />
                 <div>
@@ -5474,8 +5710,14 @@ function ProgramaProduccionScreen({ onBack }) {
                 onClick={handleAdd}
                 className="mt-3 w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 transition-colors"
               >
-                <Save size={18} /> Agregar al programa
+                <Save size={18} /> {editId != null ? "Guardar cambios" : "Agregar al programa"}
               </button>
+              {editId != null && (
+                <button type="button" onClick={cancelarEdicion}
+                  className="mt-2 w-full text-sm font-medium text-slate-600 border border-slate-300 rounded-xl py-2 hover:bg-slate-100">
+                  Cancelar edición
+                </button>
+              )}
               {toast && <div className="mt-3"><Toast {...toast} /></div>}
             </Card>
 
@@ -5539,9 +5781,14 @@ function ProgramaProduccionScreen({ onBack }) {
                           </div>
                         )}
                       </div>
-                      <button onClick={() => handleRemove(e.id)} aria-label="Eliminar" className="p-1.5 rounded-md hover:bg-slate-300 text-red-400">
-                        <Trash2 size={16} />
-                      </button>
+                      <div className="flex items-center gap-0.5 shrink-0">
+                        <button onClick={() => handleEditEntry(e)} aria-label="Editar entrada" className={`p-1.5 rounded-md hover:bg-slate-300 ${editId === e.id ? "text-amber-600" : "text-slate-600"}`}>
+                          <Pencil size={16} />
+                        </button>
+                        <button onClick={() => handleRemove(e.id)} aria-label="Eliminar" className="p-1.5 rounded-md hover:bg-slate-300 text-red-400">
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -6433,11 +6680,25 @@ const AREAS = {
     },
     detailCharts: [
       {
-        title: "Cumplimiento y mermas — Envasadora (día x turno)",
+        title: "Cumplimiento — Envasadora (día x turno)",
         format: "pct",
         series: [
           { key: "cumplimiento", label: "Cumplimiento", color: SERIES_COLORS[0], compute: (r) => computeEnvasadoMetrics(r).cumplimiento },
+        ],
+      },
+      {
+        title: "Merma de cajas — Envasadora (día x turno)",
+        format: "pct",
+        type: "line",
+        series: [
           { key: "mermaCajas", label: "Merma cajas", color: SERIES_COLORS[3], compute: (r) => computeEnvasadoMetrics(r).mermaCajas },
+        ],
+      },
+      {
+        title: "Merma de bolsas — Envasadora (día x turno)",
+        format: "pct",
+        type: "line",
+        series: [
           { key: "mermaBolsas", label: "Merma bolsas", color: SERIES_COLORS[4], compute: (r) => computeEnvasadoMetrics(r).mermaBolsas },
         ],
       },
@@ -6707,6 +6968,21 @@ function IndicadoresTab({ area }) {
             });
             return (
               <Card key={ci} title={chart.title} step={ci === 0 ? 1 : undefined}>
+                {chart.type === "line" ? (
+                  <ResponsiveContainer width="100%" height={240}>
+                    <LineChart data={chartData} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                      <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
+                      <XAxis dataKey="label" stroke="#64748b" fontSize={9} />
+                      <YAxis stroke="#64748b" fontSize={10} unit={chart.format === "pct" ? "%" : ""} tickFormatter={(v) => Number(v).toFixed(1)} />
+                      <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="4 3" />
+                      <Tooltip formatter={(v) => (chart.format === "pct" ? `${v}%` : v)} contentStyle={{ background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12, color: "#1e293b" }} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      {chart.series.map((s) => (
+                        <Line key={s.key} type="monotone" dataKey={s.key} name={s.label} stroke={s.color} strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} connectNulls isAnimationActive={false} />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={chartData} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
                     <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
@@ -6719,15 +6995,32 @@ function IndicadoresTab({ area }) {
                     ))}
                   </BarChart>
                 </ResponsiveContainer>
+                )}
               </Card>
             );
           })}
+
+          {area.key === "seleccion" && (
+            <Card title="Kg ingresados por proceso y especie (turnos mostrados)">
+              <TablaProcesoEspecie rows={agruparProcesoEspecie(merged)} />
+            </Card>
+          )}
+          {area.key === "lavado" && (
+            <Card title="Pallets lavados por tipo de bandeja (turnos mostrados)">
+              <TablaLavadoTipos rows={agruparLavadoTipos(merged)} />
+            </Card>
+          )}
+          {area.key === "envasado" && (
+            <Card title="Mermas por SKU producido (turnos mostrados)">
+              <TablaMermaSku rows={mermaPorSku(merged)} />
+            </Card>
+          )}
 
           <Card title="Detalle por turno">
             <div className="space-y-3 text-sm">
               {[...merged].reverse().map((r) => (
                 <div key={r.id} className="border-b border-slate-300/50 pb-2 last:border-0 last:pb-0">
-                  <div className="font-medium text-slate-900 mb-1">{fmtFecha(r.fecha)} · {r.turno}</div>
+                  <div className="font-medium text-slate-900 mb-1">{fmtFecha(r.fecha)} · {r.turno}{area.key === "envasado" && r.activa_envasadora === "Sí" && r.envasadora_sku ? ` · ${r.envasadora_sku}` : ""}</div>
                   {charts.map((chart, ci) => (
                     <div key={ci} className="text-xs text-slate-600">
                       {chart.series.map((s) => {
@@ -7053,6 +7346,7 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   // ---- Lavado ----
   const lav = fusionados(lavado);
   const lavTotal = sumaPor(lav, (r) => totalPalletsFromPrefix(r, "lavados"));
+  const lavTiposTabla = agruparLavadoTipos(lav);
   const lavTipos = TIPOS_BANDEJA
     .map((t) => ({ key: t.key, label: t.label.replace(/\s*\(.*\)/, ""), valor: sumaPor(lav, (r) => palletsValue(r, "lavados", t)) }))
     .filter((t) => t.valor > 0);
@@ -7123,6 +7417,17 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
     ln.diarioIng = serieDiaria(act, desde, hasta, (r) => lineaKgTotales(r, L).ing);
     ln.diarioRend = serieDiaria(act, desde, hasta, (r) => lineaKgTotales(r, L).apr, (r) => lineaKgTotales(r, L).ing);
   });
+  const selProcEsp = agruparProcesoEspecie(sel);
+  const selEspKeys = [...new Set(selProcEsp.map((x) => x.especie))];
+  const selEspColores = {};
+  selEspKeys.forEach((e, i) => { selEspColores[e] = SERIES_COLORS[i % SERIES_COLORS.length]; });
+  const selDiarioEsp = [];
+  for (let f = desde; f <= hasta; f = sumarDias(f, 1)) {
+    const fila = { label: fmtCorto(f) };
+    selEspKeys.forEach((e) => { fila[e] = 0; });
+    agruparProcesoEspecie(sel.filter((r) => r.fecha === f)).forEach((x) => { fila[x.especie] = (fila[x.especie] || 0) + x.ing; });
+    selDiarioEsp.push(fila);
+  }
   const selIng = sumaPor(selLineas, (l) => l.ing);
   const selApr = sumaPor(selLineas, (l) => l.apr);
   const selRend = selIng ? selApr / selIng : null;
@@ -7185,9 +7490,10 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   return {
     desde, hasta, turnosSel,
     turnosCerrados: { lavado: lav.length, seleccion: sel.length, envasado: env.length },
-    lavado: { total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
+    lavado: { tiposTabla: lavTiposTabla, total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
     seleccion: {
       ing: selIng, apr: selApr, prog: selProg, rend: selRend, cump: selCump, lineas: selLineas,
+      procEsp: selProcEsp, espKeys: selEspKeys, espColores: selEspColores, diarioEsp: selDiarioEsp,
     },
     envasado: {
       cajasProd, cajasProg,
@@ -7197,8 +7503,14 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
       tiempoEfectivo: teTotal || null,
       productividad: teTotal ? bolsasConTE / teTotal : null,
       detTotal, detPareto,
+      mermaSku: mermaPorSku(envasadoraActiva),
       diarioCump: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.cajasProducidas), (r) => num(r.cajasProgramadas)),
       diarioCajas: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.cajasProducidas)),
+      // Merma diaria = consumo real / consumo teórico (según lo producido) − 1.
+      diarioMermaCajas: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.cajasConsumidasReal), (r) => teoricosEnvasado(r).cajasT)
+        .map((x) => ({ ...x, valor: x.valor == null ? null : x.valor - 1 })),
+      diarioMermaBolsas: serieDiaria(envasadoraActiva, desde, hasta, (r) => num(r.bolsasConsumidasReal), (r) => teoricosEnvasado(r).bolsasT)
+        .map((x) => ({ ...x, valor: x.valor == null ? null : x.valor - 1 })),
       l5Ing, l5Apr, l5Prog,
       l5Rend: l5Ing ? l5Apr / l5Ing : null,
       l5Cump: l5Prog ? l5IngCump / l5Prog : null,
@@ -7292,6 +7604,69 @@ function SvgBarras({ data, formato = "num", color = "#3b82f6", alto = 100, ancho
         );
       })}
     </svg>
+  );
+}
+
+// Línea día a día (en porcentaje) con línea de cero; une solo los días con dato.
+function SvgLinea({ data, color = "#3b82f6", alto = 110, ancho = 560 }) {
+  const W = ancho;
+  const vals = data.map((d) => d.valor).filter((v) => v != null);
+  if (vals.length === 0) return <div className="text-[11px] text-slate-400 italic py-2">Sin datos en el período.</div>;
+  const padX = 22;
+  let max = Math.max(...vals, 0), min = Math.min(...vals, 0);
+  if (max === min) { max = max + 0.01; }
+  const rango = (max - min) * 1.2;
+  const top = max + (max - min) * 0.1;
+  const n = data.length;
+  const paso = n > 1 ? (W - padX * 2) / (n - 1) : 0;
+  const X = (i) => (n > 1 ? padX + i * paso : W / 2);
+  const Y = (v) => 8 + ((top - v) / rango) * (alto - 16);
+  const pts = data.map((d, i) => (d.valor == null ? null : [X(i), Y(d.valor)]));
+  const path = pts.reduce((acc, p, i) => (p ? acc + `${acc && pts[i - 1] ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)} ` : acc), "");
+  return (
+    <svg viewBox={`0 0 ${W} ${alto + 26}`} className="w-full" role="img">
+      <line x1="0" y1={Y(0)} x2={W} y2={Y(0)} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 3" />
+      <text x="2" y={Y(0) - 2} fontSize="8" fill="#64748b">0%</text>
+      <path d={path} fill="none" stroke={color} strokeWidth="2" />
+      {data.map((d, i) => (
+        <g key={d.fecha}>
+          {pts[i] && <circle cx={pts[i][0]} cy={pts[i][1]} r="3" fill={color} />}
+          {pts[i] && n <= 14 && <text x={pts[i][0]} y={pts[i][1] - 6} textAnchor="middle" fontSize="9" fill="#334155">{fmtNum(d.valor * 100, 1)}%</text>}
+          {(n <= 14 || i % 2 === 0) && <text x={X(i)} y={alto + 12} textAnchor="middle" fontSize="9" fill="#64748b">{d.label}</text>}
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// Gráfico lineal por día en porcentaje (SVG en el reporte, recharts en pantalla).
+function GraficoLinea({ titulo, data, color, svg, mitad }) {
+  const hay = data.some((x) => x.valor != null);
+  if (svg) {
+    return (
+      <div className="rep-bloque">
+        <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+        {hay ? <SvgLinea data={data} color={color} ancho={mitad ? 300 : 560} /> : <div className="text-[11px] text-slate-400 italic py-2">Sin datos en el período.</div>}
+      </div>
+    );
+  }
+  const d = data.map((x) => ({ label: x.label, valor: x.valor == null ? null : Number((x.valor * 100).toFixed(1)) }));
+  return (
+    <div>
+      <p className="text-xs font-semibold text-slate-700 mb-1">{titulo}</p>
+      {!hay ? <EmptyNote text="Sin datos en el período." /> : (
+        <ResponsiveContainer width="100%" height={150}>
+          <LineChart data={d} margin={{ top: 6, right: 8, left: -18, bottom: 0 }}>
+            <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" stroke="#64748b" fontSize={9} interval="preserveStartEnd" minTickGap={14} />
+            <YAxis stroke="#64748b" fontSize={10} unit="%" tickFormatter={(v) => Number(v).toFixed(1)} />
+            <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="4 3" />
+            <Tooltip formatter={(v) => `${v}%`} contentStyle={{ background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12, color: "#1e293b" }} />
+            <Line type="monotone" dataKey="valor" name={titulo} stroke={color} strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} connectNulls isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+    </div>
   );
 }
 
@@ -7590,8 +7965,10 @@ function PanelIndicadores({ r, p, svg }) {
           <Kpi label="Pallets lavados" valor={r.lavado.total} actual={r.lavado.total} previo={p.lavado.total} />
           <Kpi label="Promedio por turno" tipo="num1" valor={r.lavado.promedio} actual={r.lavado.promedio} previo={p.lavado.promedio} />
           <Kpi label="Turnos cerrados" valor={r.turnosCerrados.lavado} actual={r.turnosCerrados.lavado} previo={p.turnosCerrados.lavado} />
-          {r.lavado.tipos.map((t) => <Kpi key={t.key} label={t.label} tipo="num1" valor={t.valor} sub="pallets" />)}
         </div>
+        <SubBloque titulo="Pallets lavados por tipo de bandeja" color="#2563eb">
+          <TablaLavadoTipos rows={r.lavado.tiposTabla} />
+        </SubBloque>
         <GraficoApiladoTipos svg={svg} titulo="Pallets lavados por día, según tipo de bandeja" data={r.lavado.diarioTipos} keys={r.lavado.tiposKeys} colores={r.lavado.colores} vacio="Sin pallets lavados en el período." />
         <PendientesLavado pend={r.lavado.pendientes} turnosSel={r.turnosSel} svg={svg} />
       </SeccionArea>
@@ -7605,6 +7982,10 @@ function PanelIndicadores({ r, p, svg }) {
           <Kpi label="Rendimiento" tipo="pct" valor={r.seleccion.rend} actual={r.seleccion.rend} previo={p.seleccion.rend} />
           <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={r.seleccion.cump} tono={tonoCumplimiento(r.seleccion.cump)} actual={r.seleccion.cump} previo={p.seleccion.cump} sub={r.seleccion.prog ? `${fmtNum(r.seleccion.prog)} Kg programados` : "Sin Kg programado"} />
         </div>
+        <SubBloque titulo="Kg ingresados por proceso y especie" color="#7c3aed">
+          <TablaProcesoEspecie rows={r.seleccion.procEsp} />
+          <GraficoApiladoTipos svg={svg} titulo="Kg ingresados por día, según especie" data={r.seleccion.diarioEsp} keys={r.seleccion.espKeys} colores={r.seleccion.espColores} vacio="Sin Kg ingresados en el período." />
+        </SubBloque>
         {lineasSel.length === 0 && <EmptyNote text="Sin cierres de Selección en el período." />}
         {lineasSel.map(({ l, prev }, i) => (
           <SubBloque key={l.key} titulo={l.label} color={SERIES_COLORS[i % SERIES_COLORS.length]}>
@@ -7638,6 +8019,14 @@ function PanelIndicadores({ r, p, svg }) {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <GraficoDiario svg={svg} titulo="Cajas producidas por día" mitad data={r.envasado.diarioCajas} color="#34d399" />
             <GraficoDiario svg={svg} titulo="Cumplimiento por día" mitad data={r.envasado.diarioCump} formato="pct" color="#10b981" />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <GraficoLinea svg={svg} titulo="Merma de cajas por día" mitad data={r.envasado.diarioMermaCajas} color="#f59e0b" />
+            <GraficoLinea svg={svg} titulo="Merma de bolsas por día" mitad data={r.envasado.diarioMermaBolsas} color="#ef4444" />
+          </div>
+          <div className="rep-bloque">
+            <p className="text-xs font-semibold text-slate-700 mb-2">Mermas por SKU producido</p>
+            <TablaMermaSku rows={r.envasado.mermaSku} />
           </div>
           <div className="rep-bloque">
             <p className="text-xs font-semibold text-slate-700 mb-2">Detenciones por motivo (Pareto)</p>
@@ -8181,6 +8570,8 @@ export default function App() {
   const [skuNuevos] = useSharedList("sku-nuevos");
   SKU_NUEVOS = skuNuevos || [];
   // Conversión "bandejas por pallet" editable desde el Google Sheet.
+  const { items: procesosExtraApp } = useProcesosExtra();
+  PROCESOS_EXTRA_MOD = procesosExtraApp || [];
   const [factoresBandeja] = useSharedList("factores-bandeja");
   TIPOS_BANDEJA.forEach((t) => {
     const o = (Array.isArray(factoresBandeja) ? factoresBandeja : []).find((x) => x && x.key === t.key);
