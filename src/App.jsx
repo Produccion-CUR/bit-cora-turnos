@@ -8103,12 +8103,266 @@ function PanelIndicadores({ r, p, svg }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// PLANILLA SEMANAL (formato "Reporte Semana Plantas Curicó")
+// Kg Ing / IQF / Rend por especie + turno + línea (de los cierres de
+// Selección), más datos de ingreso manual diario (cargas de túnel, fruta
+// fresca, fruta producción, fruta en logística) y envasado Plan/Real.
+// ---------------------------------------------------------------------------
+const ESP_FIJAS_PLANILLA = ["Frambuesa", "Uva", "Arandano", "Frutilla"];
+const MANUAL_SECCIONES = [
+  { key: "fresca",     titulo: "Fruta Fresca",        especies: ["Frambuesa", "Mora", "Arandano", "Frutilla", "Uva"], hora: true },
+  { key: "produccion", titulo: "Fruta Producción",    especies: ["Frambuesa", "Mora", "Arandano"] },
+  { key: "logistica",  titulo: "Fruta en Logística",  especies: ["Frambuesa", "Mora", "Arandano", "Uva"] },
+];
+const DIAS_PLANILLA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+const espBasePlanilla = (e) => {
+  const w = String(e || "").trim().split(/\s+/)[0] || "—";
+  return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+};
+
+function useReporteManual() {
+  return useSharedList("reporte-manual-dia");
+}
+
+// Arma toda la planilla de una semana (lunes a domingo) a partir de los datos.
+function armarPlanilla(datos, manual, desde) {
+  const fechas = Array.from({ length: 7 }, (_, i) => sumarDias(desde, i));
+  const hasta = fechas[6];
+  const enRango = (r) => r.fecha && r.fecha >= desde && r.fecha <= hasta;
+  const fus = (a) => a.cierres.filter(enRango).map((c) => ({ ...(masRecientePorClave(a.inicio, c.claveTurno) || {}), ...c }));
+
+  // ---- Selección: una fila por especie + turno + línea ----
+  const filas = {};
+  fus(datos.seleccion).forEach((c) => {
+    kgPorProcesoEspecie(c).forEach((x) => {
+      const esp = espBasePlanilla(x.especie);
+      const k = `${esp}||${c.turno}||${x.linea}`;
+      const f = (filas[k] = filas[k] || { esp, turno: c.turno, linea: x.linea.replace("Línea ", "L"), dias: {} });
+      const d = (f.dias[c.fecha] = f.dias[c.fecha] || { ing: 0, apr: 0 });
+      d.ing += x.ing; d.apr += x.apr;
+    });
+  });
+  const ordenTurno = { T1: 0, T2: 1, T3: 2 };
+  const especies = [...new Set([...ESP_FIJAS_PLANILLA, ...Object.values(filas).map((f) => f.esp)])];
+  const grupos = especies.map((esp) => {
+    const rows = Object.values(filas).filter((f) => f.esp === esp)
+      .sort((a, b) => (ordenTurno[a.turno] ?? 9) - (ordenTurno[b.turno] ?? 9) || a.linea.localeCompare(b.linea));
+    const sub = {};
+    fechas.forEach((f) => {
+      sub[f] = rows.reduce((s, r) => ({ ing: s.ing + (r.dias[f]?.ing || 0), apr: s.apr + (r.dias[f]?.apr || 0) }), { ing: 0, apr: 0 });
+    });
+    return { esp, rows, sub };
+  });
+  const total = {};
+  fechas.forEach((f) => {
+    total[f] = grupos.reduce((s, g) => ({ ing: s.ing + g.sub[f].ing, apr: s.apr + g.sub[f].apr }), { ing: 0, apr: 0 });
+  });
+
+  // ---- Datos manuales ----
+  const man = {};
+  (manual || []).forEach((m) => { if (m.fecha) man[m.fecha] = m; });
+  const secciones = MANUAL_SECCIONES.map((s) => {
+    const extra = [...new Set(fechas.flatMap((f) => Object.keys(man[f]?.[s.key] || {})))]
+      .filter((e) => !s.especies.includes(e) && fechas.some((f) => num(man[f]?.[s.key]?.[e]) > 0));
+    const esps = [...s.especies, ...extra];
+    const valor = (f, e) => num(man[f]?.[s.key]?.[e]);
+    return { ...s, esps, valor, total: (f) => esps.reduce((t, e) => t + valor(f, e), 0) };
+  });
+
+  // ---- Envasado: Plan / Real por turno ----
+  const env = fus(datos.envasado);
+  const envasado = ["T1", "T2", "T3"].map((t) => {
+    const dias = {};
+    fechas.forEach((f) => {
+      const rs = env.filter((r) => r.fecha === f && r.turno === t);
+      dias[f] = { plan: sumaPor(rs, (r) => num(r.cajasProgramadas)), real: sumaPor(rs, (r) => num(r.cajasProducidas)), hay: rs.length > 0 };
+    });
+    return { turno: t, dias };
+  });
+  return { fechas, grupos, total, man, secciones, envasado };
+}
+
+function TablaPlanilla({ datos, manual, desde }) {
+  const P = useMemo(() => armarPlanilla(datos, manual, desde), [datos, manual, desde]);
+  const f0 = (v) => (v ? fmtNum(v, 0) : "-");
+  const pct = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "0%");
+  const th = "border border-slate-300 bg-sky-200 text-slate-900 font-bold px-1 py-1 text-center";
+  const td = "border border-slate-200 px-1 py-[2px] text-right whitespace-nowrap";
+  const lab = "border border-slate-200 px-1.5 py-[2px] text-left whitespace-nowrap sticky left-0 bg-white";
+  const nDias = P.fechas.length;
+  return (
+    <div className="overflow-x-auto rep-planilla">
+      <table className="text-[10px] leading-tight border-collapse min-w-full">
+        <thead>
+          <tr>
+            <th className={`${th} sticky left-0 text-left`} rowSpan={2}>Semana {fmtCorto(P.fechas[0])} – {fmtCorto(P.fechas[nDias - 1])}</th>
+            {P.fechas.map((f, i) => <th key={f} colSpan={3} className={th}>{DIAS_PLANILLA[i]} <span className="font-normal text-slate-600">{fmtCorto(f)}</span></th>)}
+          </tr>
+          <tr>{P.fechas.map((f) => ["Kg Ing", "IQF", "Rend"].map((t) => <th key={f + t} className={th}>{t}</th>))}</tr>
+        </thead>
+        <tbody>
+          {P.grupos.map((g) => (
+            <React.Fragment key={g.esp}>
+              {g.rows.map((r) => (
+                <tr key={`${r.turno}${r.linea}`}>
+                  <td className={lab}>{g.esp} {r.turno}- {r.linea}</td>
+                  {P.fechas.map((f) => {
+                    const d = r.dias[f];
+                    return [
+                      <td key={f + "a"} className={td}>{d ? fmtNum(d.ing, 0) : ""}</td>,
+                      <td key={f + "b"} className={td}>{d ? fmtNum(d.apr, 0) : ""}</td>,
+                      <td key={f + "c"} className={td}>{d && d.ing ? pct(d.apr, d.ing) : ""}</td>,
+                    ];
+                  })}
+                </tr>
+              ))}
+              <tr className="font-bold bg-sky-100">
+                <td className={`${lab} bg-sky-100`}>Sub Total {g.esp}</td>
+                {P.fechas.map((f) => [
+                  <td key={f + "a"} className={td}>{f0(g.sub[f].ing)}</td>,
+                  <td key={f + "b"} className={td}>{f0(g.sub[f].apr)}</td>,
+                  <td key={f + "c"} className={td}>{pct(g.sub[f].apr, g.sub[f].ing)}</td>,
+                ])}
+              </tr>
+            </React.Fragment>
+          ))}
+          <tr className="font-bold bg-sky-100">
+            <td className={`${lab} bg-sky-100`}>Total</td>
+            {P.fechas.map((f) => [
+              <td key={f + "a"} className={td}>{f0(P.total[f].ing)}</td>,
+              <td key={f + "b"} className={td}>{f0(P.total[f].apr)}</td>,
+              <td key={f + "c"} className={td}>{pct(P.total[f].apr, P.total[f].ing)}</td>,
+            ])}
+          </tr>
+
+          <tr className="font-bold bg-sky-300">
+            <td className={`${lab} bg-sky-300`}>Cargas de túnel</td>
+            {P.fechas.map((f) => <td key={f} colSpan={3} className={`${td} bg-sky-300`}>{f0(num(P.man[f]?.cargasTunel))}</td>)}
+          </tr>
+
+          {P.secciones.map((s) => (
+            <React.Fragment key={s.key}>
+              <tr className="font-bold bg-slate-200">
+                <td className={`${lab} bg-slate-200`}>{s.titulo}</td>
+                {P.fechas.map((f) => <td key={f} colSpan={3} className={`${td} bg-slate-200 text-center font-normal`}>{s.hora ? (P.man[f]?.frescaHora || "") : ""}</td>)}
+              </tr>
+              {s.esps.map((e) => (
+                <tr key={e}>
+                  <td className={`${lab} pl-3`}>{e}</td>
+                  {P.fechas.map((f) => <td key={f} colSpan={3} className={td}>{f0(s.valor(f, e))}</td>)}
+                </tr>
+              ))}
+              <tr className="font-bold bg-sky-100">
+                <td className={`${lab} bg-sky-100`}>Total</td>
+                {P.fechas.map((f) => <td key={f} colSpan={3} className={td}>{f0(s.total(f))}</td>)}
+              </tr>
+            </React.Fragment>
+          ))}
+
+          <tr className="font-bold bg-sky-200">
+            <td className={`${lab} bg-sky-200`}>Envasado (cajas)</td>
+            {P.fechas.map((f) => ["Plan", "Real", "%Cumpl."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
+          </tr>
+          {P.envasado.map((e) => (
+            <tr key={e.turno}>
+              <td className={lab}>Turno {e.turno.slice(1)}</td>
+              {P.fechas.map((f) => {
+                const d = e.dias[f];
+                return [
+                  <td key={f + "a"} className={td}>{d.hay ? fmtNum(d.plan, 0) : ""}</td>,
+                  <td key={f + "b"} className={td}>{d.hay ? fmtNum(d.real, 0) : ""}</td>,
+                  <td key={f + "c"} className={td}>{d.hay && d.plan ? pct(d.real, d.plan) : ""}</td>,
+                ];
+              })}
+            </tr>
+          ))}
+          <tr className="font-bold bg-sky-100">
+            <td className={`${lab} bg-sky-100`}>Total</td>
+            {P.fechas.map((f) => {
+              const plan = P.envasado.reduce((s, e) => s + e.dias[f].plan, 0);
+              const real = P.envasado.reduce((s, e) => s + e.dias[f].real, 0);
+              return [
+                <td key={f + "a"} className={td}>{f0(plan)}</td>,
+                <td key={f + "b"} className={td}>{f0(real)}</td>,
+                <td key={f + "c"} className={td}>{plan ? pct(real, plan) : "-"}</td>,
+              ];
+            })}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// Pantalla del Jefe: ingreso manual diario de los datos que la app no registra.
+function ReporteManualScreen({ onBack }) {
+  const [lista, saveLista, loading] = useReporteManual();
+  const [fecha, setFecha] = useState(today());
+  const [form, setForm] = useState({});
+  const [toast, setToast] = useState(null);
+
+  useEffect(() => {
+    const m = (lista || []).find((x) => x.fecha === fecha);
+    setForm(m ? JSON.parse(JSON.stringify(m)) : {});
+  }, [fecha, loading]);
+
+  const setSec = (sec, esp, v) => setForm((f) => ({ ...f, [sec]: { ...(f[sec] || {}), [esp]: v } }));
+
+  const guardar = async () => {
+    const reg = { ...form, id: fecha, fecha, actualizado: new Date().toISOString() };
+    // El registro del día va al final para que se sincronice con el Sheet.
+    const ok = await saveLista([...(lista || []).filter((x) => x.fecha !== fecha), reg]);
+    setToast(ok ? { kind: "ok", message: `Datos del ${fmtFecha(fecha)} guardados.` } : { kind: "error", message: "No se pudo sincronizar. Reintenta." });
+    setTimeout(() => setToast(null), 2500);
+  };
+
+  const campo = (label, val, onChange, props = {}) => (
+    <div key={label}>
+      <label className="block text-xs font-medium text-slate-600 mb-1">{label}</label>
+      <input className={inputBase} inputMode="decimal" style={props.type === "time" ? { colorScheme: "light" } : undefined} value={val ?? ""} onChange={(e) => onChange(e.target.value)} {...props} />
+    </div>
+  );
+
+  return (
+    <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
+      <TopBar title="Datos diarios del reporte" subtitle="Túnel, fruta fresca, producción y logística" onBack={onBack} icon={FileText} accent="emerald" />
+      <div className="px-4 pt-4 space-y-4">
+        <Card title="Día">
+          <TextField label="Fecha" type="date" value={fecha} onChange={setFecha} />
+          <p className="text-xs text-slate-500 mt-2">Cambia la fecha para cargar o corregir otro día. Los Kg por especie son los de la planilla semanal.</p>
+        </Card>
+        {loading ? <Card><Loader /></Card> : (
+          <>
+            <Card title="Cargas de túnel">
+              {campo("Cantidad de cargas", form.cargasTunel, (v) => setForm((f) => ({ ...f, cargasTunel: v })))}
+            </Card>
+            {MANUAL_SECCIONES.map((s) => (
+              <Card key={s.key} title={`${s.titulo} (Kg)`}>
+                {s.hora && <div className="mb-3">{campo("Hora", form.frescaHora, (v) => setForm((f) => ({ ...f, frescaHora: v })), { type: "time", inputMode: undefined })}</div>}
+                <div className="grid grid-cols-2 gap-3">
+                  {s.especies.map((e) => campo(e, form[s.key]?.[e], (v) => setSec(s.key, e, v)))}
+                </div>
+              </Card>
+            ))}
+            {toast && <Toast {...toast} />}
+            <button onClick={guardar} className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 text-sm">
+              <Save size={16} /> Guardar datos del día
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function JefeDashboard({ onBack }) {
   const lavado = useAreaCierres("lavado");
   const seleccion = useAreaCierres("seleccion");
   const envasado = useAreaCierres("envasado");
   const [programas, , loadingP] = useSharedList("programa-records");
   const [supervisoresReg] = useSupervisores();
+  const [manualDia] = useReporteManual();
   const { horarios } = useHorariosTurno();
   const [modo, setModo] = useState("semana");
   const [offset, setOffset] = useState(0);
@@ -8145,6 +8399,11 @@ function JefeDashboard({ onBack }) {
               <span className="text-xs font-normal text-slate-300">· {fmtCorto(semana.desde)} al {fmtCorto(semana.hasta)}</span>
             </button>
 
+            <Card title={`Planilla semanal · ${fmtCorto(semana.desde)} al ${fmtCorto(semana.hasta)}`}>
+              <TablaPlanilla datos={datos} manual={manualDia} desde={semana.desde} />
+              <p className="text-[11px] text-slate-500 mt-2">Kg Ing e IQF salen de los cierres de Selección; túnel, fruta fresca, producción y logística se cargan en «Datos diarios del reporte».</p>
+            </Card>
+
             <PanelIndicadores r={r} p={p} />
 
             <p className="text-xs text-slate-500">
@@ -8155,7 +8414,7 @@ function JefeDashboard({ onBack }) {
       </div>
 
       {verReporte && rSemana && (
-        <ReporteSemanalModal r={rSemana} p={pSemana} onClose={() => setVerReporte(false)} />
+        <ReporteSemanalModal r={rSemana} p={pSemana} datos={datos} manual={manualDia} onClose={() => setVerReporte(false)} />
       )}
     </div>
   );
@@ -8165,7 +8424,7 @@ function JefeDashboard({ onBack }) {
 // Reporte semanal (se abre en pantalla y se guarda como PDF con «Imprimir»).
 // Es el mismo panel de la pantalla de Indicadores, con encabezado y comentarios.
 // ---------------------------------------------------------------------------
-function ReporteSemanalModal({ r, p, onClose }) {
+function ReporteSemanalModal({ r, p, datos, manual, onClose }) {
   const ahora = fmtDateTime(new Date().toISOString());
   const H2 = "text-[13px] font-bold text-slate-900 border-b-2 border-slate-800 pb-1 mb-2 mt-5";
 
@@ -8183,6 +8442,8 @@ function ReporteSemanalModal({ r, p, onClose }) {
           .rep-titulo { break-after: avoid; }
           #reporte-print { background: #fff !important; }
           @page { size: A4; margin: 10mm; }
+          @page horiz { size: A4 landscape; margin: 8mm; }
+          .rep-horizontal { page: horiz; break-before: page; }
         }
       `}</style>
 
@@ -8228,6 +8489,11 @@ function ReporteSemanalModal({ r, p, onClose }) {
             {r.comentarios.length > 12 && <div className="text-[10px] text-slate-500 mt-1">Se muestran los 12 comentarios más recientes de {r.comentarios.length}.</div>}
           </div>
         )}
+
+        <div className="rep-horizontal">
+          <div className={H2}>Planilla semanal · {fmtCorto(r.desde)} al {fmtCorto(r.hasta)}</div>
+          <TablaPlanilla datos={datos} manual={manual} desde={r.desde} />
+        </div>
 
         <div className="text-[10px] text-slate-500 mt-4">
           Las variaciones comparan con la semana anterior (puntos porcentuales para porcentajes, % para el resto). Cumplimiento: verde desde 95 %, ámbar desde 85 %, rojo bajo eso.
@@ -8524,6 +8790,7 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
             {[
               { key: "dashboard",        label: "Indicadores generales",       desc: "Vista ejecutiva de las 3 áreas y reporte semanal en PDF", Icon: BarChart3 },
               { key: "programa",         label: "Programa de producción",      desc: "Línea, turno, especie y cantidad", Icon: CalendarDays },
+              { key: "reporte-datos",    label: "Datos diarios del reporte",   desc: "Cargas de túnel, fruta fresca, producción y logística", Icon: FileText },
               { key: "supervisores",     label: "Gestionar Supervisores",      desc: "Agregar o eliminar supervisores de los portales", Icon: User },
               { key: "horarios",         label: "Horarios de Turno",           desc: "Lunes a Sábado — minutos efectivos por turno", Icon: Clock },
               { key: "especies",         label: "Gestionar especies por línea",desc: "Agregar nuevos procesos/especies", Icon: Plus },
@@ -8674,6 +8941,7 @@ export default function App() {
 
       {/* Herramientas del Jefe — back siempre al home */}
       {screen === "dashboard" && isJefe && <JefeDashboard onBack={() => setScreen("home")} />}
+      {screen === "reporte-datos" && isJefe && <ReporteManualScreen onBack={() => setScreen("home")} />}
       {screen === "programa" && isJefe && <ProgramaProduccionScreen onBack={() => setScreen("home")} />}
       {screen === "especies" && isJefe && <EspeciesPorLineaScreen onBack={() => setScreen("home")} />}
       {screen === "insumos-config"  && isJefe && <InsumosConfigScreen onBack={() => setScreen("home")} />}
