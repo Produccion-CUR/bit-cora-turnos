@@ -7256,6 +7256,13 @@ const semanaDe = (iso) => {
   const desde = sumarDias(iso, -dow);
   return { desde, hasta: sumarDias(desde, 6) };
 };
+// Número de semana ISO del año (semana lunes a domingo; la semana 1 contiene el primer jueves).
+const semanaIso = (iso) => {
+  const d = parseIso(iso);
+  d.setDate(d.getDate() + 3 - ((d.getDay() + 6) % 7));
+  const s1 = new Date(d.getFullYear(), 0, 4);
+  return 1 + Math.round(((d - s1) / 864e5 - 3 + ((s1.getDay() + 6) % 7)) / 7);
+};
 const fmtCorto = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
 const MESES_CORTOS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
 const sumaPor = (arr, fn) => arr.reduce((s, x) => s + fn(x), 0);
@@ -7344,6 +7351,10 @@ function seguridadPorSupervisor(datos, desde, hasta) {
     haySemana: porSemana.some((r) => supervisores.some((s) => r[s] > 0)),
     hayMes: porMes.some((r) => supervisores.some((s) => r[s] > 0)),
     mesLabel: meses[meses.length - 1].label,
+    periodoLabel: (() => {
+      const a = semanaIso(desde), b = semanaIso(hasta);
+      return a === b ? `Sem ${b}` : `Sem ${a}–${b}`;
+    })(),
   };
 }
 
@@ -8091,8 +8102,8 @@ function PanelIndicadores({ r, p, svg }) {
                 <thead>
                   <tr className="text-left text-slate-500 border-b border-slate-200">
                     <th className="py-1.5 font-medium">Supervisor</th>
-                    <th className="py-1.5 font-medium text-right">Período · incidentes</th>
-                    <th className="py-1.5 font-medium text-right">Período · accidentes</th>
+                    <th className="py-1.5 font-medium text-right">{sg.periodoLabel} · incidentes</th>
+                    <th className="py-1.5 font-medium text-right">{sg.periodoLabel} · accidentes</th>
                     <th className="py-1.5 font-medium text-right">{sg.mesLabel} · incidentes</th>
                     <th className="py-1.5 font-medium text-right">{sg.mesLabel} · accidentes</th>
                   </tr>
