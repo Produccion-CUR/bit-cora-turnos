@@ -56,7 +56,12 @@ function fmtNum(v, decimales = 0) {
   });
 }
 const fmtPct = (v) => `${fmtNum((v || 0) * 100, 1)}%`;
-const today = () => new Date().toISOString().slice(0, 10);
+// Fecha de HOY en hora local (antes usaba UTC: en Chile, desde las 21:00 ya
+// devolvía el día siguiente y el cierre quedaba con el horario de otro día).
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 const fmtFecha = (iso) => {
   if (!iso) return "—";
   const [y, m, d] = iso.split("-");
@@ -82,6 +87,14 @@ const prevDateISO = (fecha) => {
   d.setDate(d.getDate() - 1);
   return d.toISOString().slice(0, 10);
 };
+
+// El turno T2 empieza en la tarde y termina de madrugada (ej. 17:00 → 02:30):
+// si se abre pasada la medianoche (antes del mediodía) y la fecha es la de hoy,
+// el turno pertenece al día anterior; así se usa el horario correcto.
+function ajustarFechaTurno(fecha, turno) {
+  if (turno === "T2" && fecha === today() && new Date().getHours() < 12) return prevDateISO(fecha);
+  return fecha;
+}
 const turnoAnterior = (fecha, turno) => {
   if (!fecha || !turno) return null;
   if (turno === "T1") return { fecha, turno: "T3" };
@@ -3833,7 +3846,7 @@ function LavadoInicio({ values, setField, editingId }) {
           <TextField label="Hora de inicio" type="time" value={values.horaInicio} onChange={(v) => setField("horaInicio", v)} />
           <div className="sm:col-span-2">
             <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-            <TurnoSelector value={values.turno} onChange={(v) => setField("turno", v)} />
+            <TurnoSelector value={values.turno} onChange={(v) => { setField("turno", v); const f = ajustarFechaTurno(values.fecha, v); if (f !== values.fecha) setField("fecha", f); }} />
           </div>
         </div>
       </Card>
@@ -4202,7 +4215,7 @@ function SeleccionInicio({ values, setField, programaEntries, editingId }) {
           <TextField label="Hora de inicio" type="time" value={values.horaInicio} onChange={(v) => setField("horaInicio", v)} />
           <div className="sm:col-span-2">
             <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-            <TurnoSelector value={values.turno} onChange={(v) => setField("turno", v)} />
+            <TurnoSelector value={values.turno} onChange={(v) => { setField("turno", v); const f = ajustarFechaTurno(values.fecha, v); if (f !== values.fecha) setField("fecha", f); }} />
           </div>
         </div>
       </Card>
@@ -4641,7 +4654,7 @@ function EnvasadoInicio({ values, setField, programaEntries, editingId }) {
           <TextField label="Hora de inicio" type="time" value={values.horaInicio} onChange={(v) => setField("horaInicio", v)} />
           <div className="sm:col-span-2">
             <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-            <TurnoSelector value={values.turno} onChange={(v) => setField("turno", v)} />
+            <TurnoSelector value={values.turno} onChange={(v) => { setField("turno", v); const f = ajustarFechaTurno(values.fecha, v); if (f !== values.fecha) setField("fecha", f); }} />
           </div>
         </div>
       </Card>
@@ -6200,7 +6213,7 @@ function EntregaMaterialesTab({ area, autor, supervisoresList }) {
           <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fecha} onChange={(e) => setFecha(e.target.value)} />
         </div>
         <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-        <TurnoSelector value={turno} onChange={setTurno} />
+        <TurnoSelector value={turno} onChange={(v) => { setTurno(v); setFecha((f) => ajustarFechaTurno(f, v)); }} />
       </Card>
 
       {!turno ? (
@@ -6887,7 +6900,15 @@ function CierreTab({ area, autor, initialTarget, supervisoresList }) {
           <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fecha} onChange={(e) => setFecha(e.target.value)} />
         </div>
         <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-        <TurnoSelector value={turno} onChange={setTurno} />
+        <TurnoSelector value={turno} onChange={(v) => { setTurno(v); setFecha((f) => ajustarFechaTurno(f, v)); }} />
+        {turno && (() => {
+          const h = horarioParaTurno(fecha, turno, horarios);
+          return h ? (
+            <p className="text-xs text-slate-500 mt-2">
+              {h.dia} · {h.horaInicio}–{h.horaFin} · <b className="text-emerald-700">{h.minutosEfectivos} min efectivos</b>
+            </p>
+          ) : null;
+        })()}
       </Card>
 
       {!turno ? (
