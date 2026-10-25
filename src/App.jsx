@@ -945,6 +945,20 @@ function especieDeProceso(lineaKey, proceso) {
   return cualquiera ? cualquiera[1] : "—";
 }
 
+// Tipo de proceso de cada proceso de la base: Selección, Spot o Apertura.
+// Es fijo por (línea + proceso). Los procesos extra lo traen en su registro;
+// para los demás se usa la lista "tipos-proceso" que edita el Jefe (por defecto
+// Selección). Se llena en App() igual que PROCESOS_EXTRA_MOD.
+const TIPOS_PROCESO = ["Selección", "Spot", "Apertura"];
+let TIPOS_PROCESO_MOD = [];
+function tipoDeProceso(lineaKey, proceso) {
+  const o = TIPOS_PROCESO_MOD.find((x) => x.lineaKey === lineaKey && x.proceso === proceso);
+  if (o && TIPOS_PROCESO.includes(o.tipo)) return o.tipo;
+  const e = PROCESOS_EXTRA_MOD.find((p) => p.lineaKey === lineaKey && p.proceso === proceso);
+  if (e && TIPOS_PROCESO.includes(e.tipo)) return e.tipo;
+  return "Selección";
+}
+
 // Kg ingresados/aprobados de UN registro de Selección, separados por línea +
 // proceso (+ especie del proceso). Usa el proceso elegido en el Inicio de
 // turno para cada slot de especie. Solo líneas activas y especies no quitadas.
@@ -958,7 +972,10 @@ function kgPorProcesoEspecie(r) {
       const ing = num(r[`kg_${l.key}_e${s}_ing`]);
       const apr = kgAprobadoTotal(r, l.key, s);
       if (!proceso || (!ing && !apr)) return;
-      out.push({ lineaKey: l.key, linea: l.label, proceso, especie: especieDeProceso(l.key, proceso), ing, apr });
+      // El tipo se guarda al elegir el proceso en el Inicio de turno; los registros
+      // antiguos no lo tienen y toman el tipo vigente de la base.
+      const tipo = r[`linea_${l.key}_tipo${sufijoEspecie(s)}`] || tipoDeProceso(l.key, proceso);
+      out.push({ lineaKey: l.key, linea: l.label, proceso, tipo, especie: especieDeProceso(l.key, proceso), ing, apr });
     });
   });
   return out;
@@ -968,13 +985,13 @@ function kgPorProcesoEspecie(r) {
 function agruparProcesoEspecie(registros) {
   const m = {};
   registros.forEach((r) => kgPorProcesoEspecie(r).forEach((x) => {
-    const k = `${x.especie}||${x.proceso}`;
-    m[k] = m[k] || { especie: x.especie, proceso: x.proceso, ing: 0, apr: 0, lineas: new Set() };
+    const k = `${x.tipo}||${x.especie}||${x.proceso}`;
+    m[k] = m[k] || { tipo: x.tipo, especie: x.especie, proceso: x.proceso, ing: 0, apr: 0, lineas: new Set() };
     m[k].ing += x.ing; m[k].apr += x.apr; m[k].lineas.add(x.linea);
   }));
   return Object.values(m)
     .map((x) => ({ ...x, lineas: [...x.lineas].sort().join(", ") }))
-    .sort((a, b) => a.especie.localeCompare(b.especie) || b.ing - a.ing);
+    .sort((a, b) => TIPOS_PROCESO.indexOf(a.tipo) - TIPOS_PROCESO.indexOf(b.tipo) || a.especie.localeCompare(b.especie) || b.ing - a.ing);
 }
 
 // Mermas de Envasadora asociadas al SKU producido (una fila por SKU).
@@ -999,48 +1016,66 @@ function mermaPorSku(registros) {
 
 function TablaProcesoEspecie({ rows }) {
   if (!rows.length) return <EmptyNote text="Sin Kg ingresados por proceso en el período." />;
-  const porEsp = [];
-  rows.forEach((x) => {
-    let g = porEsp.find((e) => e.especie === x.especie);
-    if (!g) { g = { especie: x.especie, ing: 0, apr: 0, procesos: [] }; porEsp.push(g); }
-    g.ing += x.ing; g.apr += x.apr; g.procesos.push(x);
-  });
-  const tot = rows.reduce((a, x) => ({ ing: a.ing + x.ing, apr: a.apr + x.apr }), { ing: 0, apr: 0 });
+  const suma = (lista) => lista.reduce((a, x) => ({ ing: a.ing + x.ing, apr: a.apr + x.apr }), { ing: 0, apr: 0 });
+  const tot = suma(rows);
+  const celdas = (t) => (
+    <>
+      <td className="text-right">{fmtNum(t.ing)}</td>
+      <td className="text-right">{fmtNum(t.apr)}</td>
+      <td className="text-right">{t.ing ? fmtPct(t.apr / t.ing) : "—"}</td>
+    </>
+  );
+  // Primero por tipo de proceso (Selección / Spot / Apertura), dentro de cada tipo por especie.
+  const tipos = TIPOS_PROCESO.map((tipo) => {
+    const delTipo = rows.filter((x) => (x.tipo || "Selección") === tipo);
+    const porEsp = [];
+    delTipo.forEach((x) => {
+      let g = porEsp.find((e) => e.especie === x.especie);
+      if (!g) { g = { especie: x.especie, procesos: [] }; porEsp.push(g); }
+      g.procesos.push(x);
+    });
+    return { tipo, porEsp, tot: suma(delTipo), hay: delTipo.length > 0 };
+  }).filter((t) => t.hay);
   return (
     <div className="rep-bloque overflow-x-auto">
       <table className="w-full text-xs">
         <thead>
           <tr className="text-left text-slate-500 border-b border-slate-200">
-            <th className="py-1 font-medium">Especie / Proceso</th>
+            <th className="py-1 font-medium">Tipo / Especie / Proceso</th>
             <th className="py-1 font-medium text-right">Kg ingresados</th>
             <th className="py-1 font-medium text-right">Kg aprobados</th>
             <th className="py-1 font-medium text-right">Rend.</th>
           </tr>
         </thead>
         <tbody>
-          {porEsp.map((g) => (
-            <React.Fragment key={g.especie}>
-              <tr className="bg-violet-50 font-semibold text-slate-800">
-                <td className="py-1 px-1">{g.especie}</td>
-                <td className="text-right">{fmtNum(g.ing)}</td>
-                <td className="text-right">{fmtNum(g.apr)}</td>
-                <td className="text-right">{g.ing ? fmtPct(g.apr / g.ing) : "—"}</td>
+          {tipos.map((t) => (
+            <React.Fragment key={t.tipo}>
+              <tr className="bg-violet-200 font-bold text-slate-900">
+                <td className="py-1 px-1">{t.tipo}</td>
+                {celdas(t.tot)}
               </tr>
-              {g.procesos.map((x) => (
-                <tr key={x.proceso} className="border-b border-slate-100 text-slate-700">
-                  <td className="py-0.5 pl-3">{x.proceso}<span className="text-slate-400"> · {x.lineas}</span></td>
-                  <td className="text-right">{fmtNum(x.ing)}</td>
-                  <td className="text-right">{fmtNum(x.apr)}</td>
-                  <td className="text-right">{x.ing ? fmtPct(x.apr / x.ing) : "—"}</td>
-                </tr>
-              ))}
+              {t.porEsp.map((g) => {
+                const sg = suma(g.procesos);
+                return (
+                  <React.Fragment key={g.especie}>
+                    <tr className="bg-violet-50 font-semibold text-slate-800">
+                      <td className="py-1 px-1 pl-3">{g.especie}</td>
+                      {celdas(sg)}
+                    </tr>
+                    {g.procesos.map((x) => (
+                      <tr key={x.proceso} className="border-b border-slate-100 text-slate-700">
+                        <td className="py-0.5 pl-6">{x.proceso}<span className="text-slate-400"> · {x.lineas}</span></td>
+                        {celdas(x)}
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                );
+              })}
             </React.Fragment>
           ))}
           <tr className="font-bold text-slate-900 border-t border-slate-300">
             <td className="py-1">Total</td>
-            <td className="text-right">{fmtNum(tot.ing)}</td>
-            <td className="text-right">{fmtNum(tot.apr)}</td>
-            <td className="text-right">{tot.ing ? fmtPct(tot.apr / tot.ing) : "—"}</td>
+            {celdas(tot)}
           </tr>
         </tbody>
       </table>
@@ -1136,21 +1171,28 @@ function especiesUnicas(procesos) {
 // ---------------------------------------------------------------------------
 // Procesos/especies extra agregados por el Jefe de producción (persistente).
 // Permite sumar nuevos pares [Proceso, Especie] a una línea sin tocar código.
-// Estructura almacenada: [{ id, lineaKey, proceso, especie }]
+// Estructura almacenada: [{ id, lineaKey, proceso, especie, tipo }]
 // ---------------------------------------------------------------------------
 function useProcesosExtra() {
   const [items, save, loading] = useSharedList("procesos-extra");
 
   const porLinea = (lineaKey) => items.filter((p) => p.lineaKey === lineaKey).map((p) => [p.proceso, p.especie]);
 
-  const agregar = async (lineaKey, proceso, especie) => {
-    const entry = { id: Date.now(), lineaKey, proceso: proceso.trim(), especie: especie.trim() };
+  const agregar = async (lineaKey, proceso, especie, tipo = "Selección") => {
+    const entry = { id: Date.now(), lineaKey, proceso: proceso.trim(), especie: especie.trim(), tipo };
     return save([...items, entry]);
+  };
+
+  // Cambia el tipo de un proceso extra (queda como último para sincronizar con el Sheet).
+  const cambiarTipo = async (id, tipo) => {
+    const it = items.find((p) => p.id === id);
+    if (!it) return false;
+    return save([...items.filter((p) => p.id !== id), { ...it, tipo }]);
   };
 
   const eliminar = async (id) => save(items.filter((p) => p.id !== id));
 
-  return { items, porLinea, agregar, eliminar, loading };
+  return { items, porLinea, agregar, eliminar, cambiarTipo, loading };
 }
 
 // Combina los procesos base (hardcodeados) de una línea con los extra agregados por el Jefe.
@@ -1291,7 +1333,8 @@ function especieDisplay(entry) {
 function procesoDisplay(entry) {
   if (!entry || entry.especie === "LAVADO") return entry?.especie || "";
   if (entry.lineaKey === "envasadora") return especieDisplay(entry);
-  return entry.especie || "—";
+  const tipo = entry.tipoProceso || tipoDeProceso(entry.lineaKey, entry.especie);
+  return tipo && tipo !== "Selección" ? `${entry.especie || "—"} (${tipo})` : (entry.especie || "—");
 }
 
 // ---------------------------------------------------------------------------
@@ -4054,7 +4097,10 @@ function LineaCard({ linea, values, setField, procesosExtra, programaEntries }) 
     progLinea.slice(0, ESPECIE_SLOTS.length).forEach((entry, idx) => {
       const slot = ESPECIE_SLOTS[idx];
       const campo = `linea_${linea.key}_proceso${sufijoEspecie(slot)}`;
-      if (entry.especie) setField(campo, entry.especie);
+      if (entry.especie) {
+        setField(campo, entry.especie);
+        setField(`linea_${linea.key}_tipo${sufijoEspecie(slot)}`, tipoDeProceso(linea.key, entry.especie));
+      }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activa, progLinea.map(e => e.especie).join(","), linea.key]);
@@ -4062,8 +4108,13 @@ function LineaCard({ linea, values, setField, procesosExtra, programaEntries }) 
   const slots = ESPECIE_SLOTS.map((slot) => {
     const campo = `linea_${linea.key}_proceso${sufijoEspecie(slot)}`;
     const proceso = values[campo] || "";
-    return { slot, campo, proceso, especie: especieFor(procesosCompletos, proceso) };
+    return { slot, campo, proceso, especie: especieFor(procesosCompletos, proceso), tipo: proceso ? tipoDeProceso(linea.key, proceso) : "" };
   });
+  // Al elegir el proceso se guarda también su tipo (Selección / Spot / Apertura).
+  const setProceso = (slot, v) => {
+    setField(`linea_${linea.key}_proceso${sufijoEspecie(slot)}`, v);
+    setField(`linea_${linea.key}_tipo${sufijoEspecie(slot)}`, v ? tipoDeProceso(linea.key, v) : "");
+  };
 
   return (
     <div className="border border-slate-300 rounded-lg p-3 space-y-2">
@@ -4093,7 +4144,7 @@ function LineaCard({ linea, values, setField, procesosExtra, programaEntries }) 
             <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-xs text-blue-800">
               ✓ Procesos cargados desde el Programa de producción.
               <button type="button" onClick={() => {
-                ESPECIE_SLOTS.forEach(s => setField(`linea_${linea.key}_proceso${sufijoEspecie(s)}`, ""));
+                ESPECIE_SLOTS.forEach(s => setProceso(s, ""));
               }} className="ml-2 underline text-blue-600">Limpiar</button>
             </div>
           )}
@@ -4106,22 +4157,22 @@ function LineaCard({ linea, values, setField, procesosExtra, programaEntries }) 
           <SelectField
             label="Especie / proceso 1"
             value={slots[0].proceso}
-            onChange={(v) => setField(slots[0].campo, v)}
+            onChange={(v) => setProceso(1, v)}
             options={procesosCompletos.map((p) => p[0])}
           />
-          {slots[0].especie && <p className="text-xs text-slate-500">Especie: {slots[0].especie}</p>}
+          {slots[0].especie && <p className="text-xs text-slate-500">Especie: {slots[0].especie} · Tipo: <b>{slots[0].tipo}</b></p>}
 
           <p className="text-xs text-slate-500 pt-1">Hasta 4 especies adicionales (opcional):</p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {slots.slice(1).map(({ slot, campo, proceso, especie }) => (
+            {slots.slice(1).map(({ slot, campo, proceso, especie, tipo }) => (
               <div key={slot}>
                 <SelectField
                   label={`Especie / proceso ${slot}`}
                   value={proceso}
-                  onChange={(v) => setField(campo, v)}
+                  onChange={(v) => setProceso(slot, v)}
                   options={procesosCompletos.map((p) => p[0])}
                 />
-                {especie && <p className="text-xs text-slate-500 mt-1">Especie: {especie}</p>}
+                {especie && <p className="text-xs text-slate-500 mt-1">Especie: {especie} · Tipo: <b>{tipo}</b></p>}
               </div>
             ))}
           </div>
@@ -5480,6 +5531,7 @@ function ProgramaProduccionScreen({ onBack }) {
       lineaLabel: lineaCfg?.label || draft.lineaKey,
       turno: draft.turno,
       especie: draft.especie,
+      ...(!esLavado && !esEnvasadora ? { tipoProceso: tipoDeProceso(draft.lineaKey, draft.especie) } : {}),
       cantidad: esLavado ? 0 : num(draft.cantidad),
       unidad: lineaCfg?.unidad || "",
     };
@@ -5678,11 +5730,11 @@ function ProgramaProduccionScreen({ onBack }) {
                           label="Proceso / Especie"
                           value={draft.especie}
                           onChange={(v) => setDraftField("especie", v)}
-                          optionsKV={(lineaCfg?.procesos || []).map(([p, e]) => [p, `${p} — ${e}`])}
+                          optionsKV={(lineaCfg?.procesos || []).map(([p, e]) => [p, `${p} — ${e} · ${tipoDeProceso(lineaCfg.key, p)}`])}
                           placeholder={lineaCfg ? "Seleccionar…" : "Primero elige una línea"}
                         />
                         {draft.especie && lineaCfg && (
-                          <p className="text-xs text-emerald-700 mt-1">✓ Especie: {especieFor(lineaCfg.procesos, draft.especie) || "—"}</p>
+                          <p className="text-xs text-emerald-700 mt-1">✓ Especie: {especieFor(lineaCfg.procesos, draft.especie) || "—"} · Tipo: <b>{tipoDeProceso(lineaCfg.key, draft.especie)}</b></p>
                         )}
                       </>
                     )
@@ -5836,7 +5888,9 @@ const LINEAS_TODAS = [
 ];
 
 function EspeciesPorLineaScreen({ onBack }) {
-  const { items, porLinea, agregar, eliminar, loading } = useProcesosExtra();
+  const { items, porLinea, agregar, eliminar, cambiarTipo, loading } = useProcesosExtra();
+  const [tiposOverride, saveTiposOverride] = useSharedList("tipos-proceso");
+  const [tipoNuevo, setTipoNuevo] = useState("Selección");
   const [lineaKey, setLineaKey] = useState(LINEAS_TODAS[0].key);
   const [proceso, setProceso] = useState("");
   const [especie, setEspecie] = useState("");
@@ -5847,7 +5901,7 @@ function EspeciesPorLineaScreen({ onBack }) {
       setToast({ kind: "error", message: "Completa línea, proceso y especie antes de agregar." });
       return;
     }
-    const ok = await agregar(lineaKey, proceso, especie);
+    const ok = await agregar(lineaKey, proceso, especie, tipoNuevo);
     if (ok) {
       setToast({ kind: "ok", message: "Especie agregada a la línea." });
       setProceso("");
@@ -5864,6 +5918,22 @@ function EspeciesPorLineaScreen({ onBack }) {
 
   const extraDeLinea = items.filter((p) => p.lineaKey === lineaKey);
 
+  // Todos los procesos de la línea (base + extra) con su tipo vigente.
+  const procesosLinea = [
+    ...((LINEAS_SELECCION.find((l) => l.key === lineaKey)?.procesos || []).map(([p, e]) => ({ proceso: p, especie: e, extra: null }))),
+    ...extraDeLinea.map((p) => ({ proceso: p.proceso, especie: p.especie, extra: p })),
+  ];
+  const tipoVigente = (p) => (tiposOverride || []).find((x) => x.lineaKey === lineaKey && x.proceso === p.proceso)?.tipo || p.extra?.tipo || "Selección";
+  const handleTipo = async (p, tipo) => {
+    let ok;
+    if (p.extra) ok = await cambiarTipo(p.extra.id, tipo);
+    else {
+      const resto = (tiposOverride || []).filter((x) => !(x.lineaKey === lineaKey && x.proceso === p.proceso));
+      ok = await saveTiposOverride([...resto, { id: `${lineaKey}||${p.proceso}`, lineaKey, proceso: p.proceso, tipo }]);
+    }
+    setToast(ok ? { kind: "ok", message: `${p.proceso}: ${tipo}.` } : { kind: "error", message: "No se pudo guardar el tipo." });
+  };
+
   return (
     <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
       <TopBar title="Gestionar especies por línea" subtitle="Agrega nuevos procesos/especies sin tocar código" onBack={onBack} icon={Plus} accent="emerald" />
@@ -5874,6 +5944,7 @@ function EspeciesPorLineaScreen({ onBack }) {
             <SelectField label="Línea" value={lineaKey} onChange={setLineaKey} optionsKV={LINEAS_TODAS.map((l) => [l.key, l.label])} />
             <TextField label="Proceso (nombre exacto del SKU/proceso)" value={proceso} onChange={setProceso} />
             <TextField label="Especie" value={especie} onChange={setEspecie} />
+            <SelectField label="Tipo de proceso" value={tipoNuevo} onChange={setTipoNuevo} options={TIPOS_PROCESO} />
           </div>
           {toast && <div className="mt-3"><Toast {...toast} /></div>}
           <button
@@ -5882,6 +5953,27 @@ function EspeciesPorLineaScreen({ onBack }) {
           >
             <Plus size={18} /> Agregar especie
           </button>
+        </Card>
+
+        <Card title={`Tipo de proceso · ${LINEAS_TODAS.find((l) => l.key === lineaKey)?.label}`}>
+          {procesosLinea.length === 0 ? (
+            <EmptyNote text="Esta línea todavía no tiene procesos." />
+          ) : (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-500">Cada proceso es Selección, Spot o Apertura. Se usa en el Programa, el Inicio de turno y los indicadores (por defecto: Selección).</p>
+              {procesosLinea.map((p) => (
+                <div key={p.proceso} className="flex items-center justify-between gap-2 border-b border-slate-200 pb-2 last:border-0 last:pb-0">
+                  <div className="text-sm min-w-0">
+                    <div className="font-medium text-slate-900 truncate">{p.proceso}</div>
+                    <div className="text-xs text-slate-500">{p.especie}</div>
+                  </div>
+                  <select className="border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white" value={tipoVigente(p)} onChange={(e) => handleTipo(p, e.target.value)}>
+                    {TIPOS_PROCESO.map((t) => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
 
         <Card title={`Especies agregadas a ${LINEAS_TODAS.find((l) => l.key === lineaKey)?.label}`}>
@@ -5895,7 +5987,7 @@ function EspeciesPorLineaScreen({ onBack }) {
                 <div key={p.id} className="flex items-center justify-between border-b border-slate-200 pb-2 last:border-0 last:pb-0">
                   <div className="text-sm">
                     <div className="font-medium text-slate-900">{p.proceso}</div>
-                    <div className="text-xs text-slate-500">Especie: {p.especie}</div>
+                    <div className="text-xs text-slate-500">Especie: {p.especie} · Tipo: {p.tipo || "Selección"}</div>
                   </div>
                   <button onClick={() => handleEliminar(p.id)} aria-label="Eliminar" className="p-1.5 rounded-md hover:bg-slate-200 text-red-500">
                     <Trash2 size={16} />
@@ -8874,6 +8966,8 @@ export default function App() {
   // Conversión "bandejas por pallet" editable desde el Google Sheet.
   const { items: procesosExtraApp } = useProcesosExtra();
   PROCESOS_EXTRA_MOD = procesosExtraApp || [];
+  const [tiposProcesoApp] = useSharedList("tipos-proceso");
+  TIPOS_PROCESO_MOD = tiposProcesoApp || [];
   const [factoresBandeja] = useSharedList("factores-bandeja");
   TIPOS_BANDEJA.forEach((t) => {
     const o = (Array.isArray(factoresBandeja) ? factoresBandeja : []).find((x) => x && x.key === t.key);
