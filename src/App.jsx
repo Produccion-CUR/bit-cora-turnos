@@ -8071,7 +8071,7 @@ function PanelIndicadores({ r, p, svg }) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         <Kpi grande label="Pallets lavados" valor={r.lavado.total} actual={r.lavado.total} previo={p.lavado.total} sub={`${cerrados} turnos cerrados`} />
         <Kpi grande label="Rendimiento Selección" tipo="pct" valor={r.seleccion.rend} actual={r.seleccion.rend} previo={p.seleccion.rend} sub={`${fmtNum(r.seleccion.ing)} Kg ingresados`} />
-        <Kpi grande label="Cumplimiento Envasadora" tipo="pct" valor={r.envasado.cump} tono={tonoCumplimiento(r.envasado.cump)} actual={r.envasado.cump} previo={p.envasado.cump} sub={`${fmtNum(r.envasado.cajasProd)} / ${fmtNum(r.envasado.cajasProg)} cajas`} />
+        <Kpi grande label="Cumplimiento Envasadora" tipo="pct" valor={r.envasado.cump} tono={tonoCumplimiento(r.envasado.cump)} actual={r.envasado.cump} previo={p.envasado.cump} sub={<><div>{fmtNum(r.envasado.cajasProd)} / {fmtNum(r.envasado.cajasProg)} cajas</div><div>Merma cajas: <b className="text-slate-700">{r.envasado.mermaCajas == null ? "—" : fmtPct(r.envasado.mermaCajas)}</b></div><div>Merma bolsas: <b className="text-slate-700">{r.envasado.mermaBolsas == null ? "—" : fmtPct(r.envasado.mermaBolsas)}</b></div></>} />
         <Kpi grande label="Incidentes / accidentes" valor={r.seguridad.incidentes + r.seguridad.accidentes} tono={r.seguridad.accidentes > 0 ? "bad" : r.seguridad.incidentes > 0 ? "warn" : "ok"} sub={`${r.seguridad.incidentes} incidentes · ${r.seguridad.accidentes} accidentes`} actual={r.seguridad.incidentes + r.seguridad.accidentes} previo={p.seguridad.incidentes + p.seguridad.accidentes} menorEsMejor />
       </div>
 
@@ -8242,7 +8242,14 @@ const MANUAL_SECCIONES = [
 const DIAS_PLANILLA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 const espBasePlanilla = (e) => {
   const w = String(e || "").trim().split(/\s+/)[0] || "—";
-  return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  const nombre = w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  // Abreviaciones (ej. "ARAND") se unen a la especie completa ("Arandano").
+  const lw = w.toLowerCase();
+  const completa = [...ESP_FIJAS_PLANILLA, "Mora"].find((f) => {
+    const lf = f.toLowerCase();
+    return lw.length >= 4 ? (lf.startsWith(lw) || lw.startsWith(lf)) : lf === lw;
+  });
+  return completa || nombre;
 };
 
 function useReporteManual() {
@@ -8307,7 +8314,7 @@ function armarPlanilla(datos, manual, desde) {
   return { fechas, grupos, total, man, secciones, envasado };
 }
 
-function TablaPlanilla({ datos, manual, desde }) {
+function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
   const P = useMemo(() => armarPlanilla(datos, manual, desde), [datos, manual, desde]);
   const f0 = (v) => (v ? fmtNum(v, 0) : "-");
   const pct = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "0%");
@@ -8321,7 +8328,11 @@ function TablaPlanilla({ datos, manual, desde }) {
         <thead>
           <tr>
             <th className={`${th} sticky left-0 text-left`} rowSpan={2}>Semana {fmtCorto(P.fechas[0])} – {fmtCorto(P.fechas[nDias - 1])}</th>
-            {P.fechas.map((f, i) => <th key={f} colSpan={3} className={th}>{DIAS_PLANILLA[i]} <span className="font-normal text-slate-600">{fmtCorto(f)}</span></th>)}
+            {P.fechas.map((f, i) => (
+              <th key={f} colSpan={3} className={`${th} ${onDia ? "cursor-pointer hover:bg-sky-300" : ""} ${diaSel === f ? "bg-sky-400" : ""}`} onClick={onDia ? () => onDia(f) : undefined}>
+                {DIAS_PLANILLA[i]} <span className="font-normal text-slate-600">{fmtCorto(f)}</span>
+              </th>
+            ))}
           </tr>
           <tr>{P.fechas.map((f) => ["Kg Ing", "IQF", "Rend"].map((t) => <th key={f + t} className={th}>{t}</th>))}</tr>
         </thead>
@@ -8419,10 +8430,9 @@ function TablaPlanilla({ datos, manual, desde }) {
   );
 }
 
-// Pantalla del Jefe: ingreso manual diario de los datos que la app no registra.
-function ReporteManualScreen({ onBack }) {
+// Formulario de ingreso manual diario (cargas de túnel, fruta fresca, producción y logística).
+function FormularioDatosDia({ fecha, setFecha }) {
   const [lista, saveLista, loading] = useReporteManual();
-  const [fecha, setFecha] = useState(today());
   const [form, setForm] = useState({});
   const [toast, setToast] = useState(null);
 
@@ -8449,32 +8459,64 @@ function ReporteManualScreen({ onBack }) {
   );
 
   return (
-    <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
-      <TopBar title="Datos diarios del reporte" subtitle="Túnel, fruta fresca, producción y logística" onBack={onBack} icon={FileText} accent="emerald" />
-      <div className="px-4 pt-4 space-y-4">
-        <Card title="Día">
-          <TextField label="Fecha" type="date" value={fecha} onChange={setFecha} />
-          <p className="text-xs text-slate-500 mt-2">Cambia la fecha para cargar o corregir otro día. Los Kg por especie son los de la planilla semanal.</p>
-        </Card>
-        {loading ? <Card><Loader /></Card> : (
-          <>
-            <Card title="Cargas de túnel">
-              {campo("Cantidad de cargas", form.cargasTunel, (v) => setForm((f) => ({ ...f, cargasTunel: v })))}
+    <div className="space-y-4">
+      <Card title="Datos pendientes del día">
+        <TextField label="Fecha" type="date" value={fecha} onChange={setFecha} />
+        <p className="text-xs text-slate-500 mt-2">Toca un día en la planilla (o cambia la fecha) para cargar o corregir sus datos. Kg ingresados e IQF salen solos de los cierres; envasado también.</p>
+      </Card>
+      {loading ? <Card><Loader /></Card> : (
+        <>
+          <Card title="Cargas de túnel">
+            {campo("Cantidad de cargas", form.cargasTunel, (v) => setForm((f) => ({ ...f, cargasTunel: v })))}
+          </Card>
+          {MANUAL_SECCIONES.map((s) => (
+            <Card key={s.key} title={`${s.titulo} (Kg)`}>
+              {s.hora && <div className="mb-3">{campo("Hora", form.frescaHora, (v) => setForm((f) => ({ ...f, frescaHora: v })), { type: "time", inputMode: undefined })}</div>}
+              <div className="grid grid-cols-2 gap-3">
+                {s.especies.map((e) => campo(e, form[s.key]?.[e], (v) => setSec(s.key, e, v)))}
+              </div>
             </Card>
-            {MANUAL_SECCIONES.map((s) => (
-              <Card key={s.key} title={`${s.titulo} (Kg)`}>
-                {s.hora && <div className="mb-3">{campo("Hora", form.frescaHora, (v) => setForm((f) => ({ ...f, frescaHora: v })), { type: "time", inputMode: undefined })}</div>}
-                <div className="grid grid-cols-2 gap-3">
-                  {s.especies.map((e) => campo(e, form[s.key]?.[e], (v) => setSec(s.key, e, v)))}
-                </div>
-              </Card>
-            ))}
-            {toast && <Toast {...toast} />}
-            <button onClick={guardar} className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 text-sm">
-              <Save size={16} /> Guardar datos del día
-            </button>
-          </>
-        )}
+          ))}
+          {toast && <Toast {...toast} />}
+          <button onClick={guardar} className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 text-sm">
+            <Save size={16} /> Guardar datos del día
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Pantalla "Reporte semanal" (botón en el Inicio): planilla de la semana + ingreso de datos pendientes.
+function ReporteSemanalScreen({ onBack }) {
+  const lavado = useAreaCierres("lavado");
+  const seleccion = useAreaCierres("seleccion");
+  const envasado = useAreaCierres("envasado");
+  const [manual] = useReporteManual();
+  const [offset, setOffset] = useState(0);
+  const [fecha, setFecha] = useState(today());
+  const semana = semanaDe(sumarDias(today(), offset * 7));
+  const loading = lavado.loading || seleccion.loading || envasado.loading;
+  const datos = { lavado, seleccion, envasado };
+
+  return (
+    <div className="w-full max-w-2xl lg:max-w-5xl mx-auto pb-10">
+      <TopBar title="Reporte semanal" subtitle="Planilla de producción de la semana" onBack={onBack} icon={FileText} accent="emerald" />
+      <div className="p-4 space-y-4">
+        <div className="flex items-center justify-between bg-white border border-slate-200 rounded-xl px-2 py-1.5">
+          <button onClick={() => setOffset(offset - 1)} className="p-2 rounded-lg hover:bg-slate-100" aria-label="Semana anterior"><ChevronLeft size={18} /></button>
+          <div className="text-center">
+            <div className="text-sm font-semibold text-slate-900">Semana {semanaIso(semana.desde)}</div>
+            <div className="text-xs text-slate-500">{fmtFecha(semana.desde)} – {fmtFecha(semana.hasta)}</div>
+          </div>
+          <button onClick={() => setOffset(offset + 1)} className="p-2 rounded-lg hover:bg-slate-100" aria-label="Semana siguiente"><ChevronRight size={18} /></button>
+        </div>
+        <Card title="Planilla semanal">
+          {loading ? <Loader text="Armando la planilla…" /> : (
+            <TablaPlanilla datos={datos} manual={manual} desde={semana.desde} onDia={(f) => { setFecha(f); document.getElementById("datos-dia")?.scrollIntoView({ behavior: "smooth" }); }} diaSel={fecha} />
+          )}
+        </Card>
+        <div id="datos-dia"><FormularioDatosDia fecha={fecha} setFecha={setFecha} /></div>
       </div>
     </div>
   );
@@ -8522,11 +8564,6 @@ function JefeDashboard({ onBack }) {
               <FileText size={18} /> Generar reporte semanal (PDF)
               <span className="text-xs font-normal text-slate-300">· {fmtCorto(semana.desde)} al {fmtCorto(semana.hasta)}</span>
             </button>
-
-            <Card title={`Planilla semanal · ${fmtCorto(semana.desde)} al ${fmtCorto(semana.hasta)}`}>
-              <TablaPlanilla datos={datos} manual={manualDia} desde={semana.desde} />
-              <p className="text-[11px] text-slate-500 mt-2">Kg Ing e IQF salen de los cierres de Selección; túnel, fruta fresca, producción y logística se cargan en «Datos diarios del reporte».</p>
-            </Card>
 
             <PanelIndicadores r={r} p={p} />
 
@@ -8907,6 +8944,18 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
           <ChevronRight size={24} className="text-white/70 shrink-0" />
         </button>
 
+        <button onClick={() => onNavigate("reporte-semanal")}
+          className="w-full bg-gradient-to-br from-teal-600 to-emerald-700 hover:from-teal-500 hover:to-emerald-600 text-white rounded-2xl p-6 text-left shadow-lg transition-all flex items-center gap-5">
+          <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
+            <FileText size={30} className="text-white" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="font-extrabold text-xl leading-tight">Reporte semanal</div>
+            <div className="text-emerald-100 text-sm mt-1">Planilla de la semana · Túnel, fruta fresca, producción y logística</div>
+          </div>
+          <ChevronRight size={24} className="text-white/70 shrink-0" />
+        </button>
+
         {/* Accesos Jefe de producción */}
         {isJefe && (
           <div className="pt-2 space-y-2">
@@ -8914,7 +8963,6 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
             {[
               { key: "dashboard",        label: "Indicadores generales",       desc: "Vista ejecutiva de las 3 áreas y reporte semanal en PDF", Icon: BarChart3 },
               { key: "programa",         label: "Programa de producción",      desc: "Línea, turno, especie y cantidad", Icon: CalendarDays },
-              { key: "reporte-datos",    label: "Datos diarios del reporte",   desc: "Cargas de túnel, fruta fresca, producción y logística", Icon: FileText },
               { key: "supervisores",     label: "Gestionar Supervisores",      desc: "Agregar o eliminar supervisores de los portales", Icon: User },
               { key: "horarios",         label: "Horarios de Turno",           desc: "Lunes a Sábado — minutos efectivos por turno", Icon: Clock },
               { key: "especies",         label: "Gestionar especies por línea",desc: "Agregar nuevos procesos/especies", Icon: Plus },
@@ -9067,7 +9115,7 @@ export default function App() {
 
       {/* Herramientas del Jefe — back siempre al home */}
       {screen === "dashboard" && isJefe && <JefeDashboard onBack={() => setScreen("home")} />}
-      {screen === "reporte-datos" && isJefe && <ReporteManualScreen onBack={() => setScreen("home")} />}
+      {screen === "reporte-semanal" && <ReporteSemanalScreen onBack={() => setScreen("home")} />}
       {screen === "programa" && isJefe && <ProgramaProduccionScreen onBack={() => setScreen("home")} />}
       {screen === "especies" && isJefe && <EspeciesPorLineaScreen onBack={() => setScreen("home")} />}
       {screen === "insumos-config"  && isJefe && <InsumosConfigScreen onBack={() => setScreen("home")} />}
