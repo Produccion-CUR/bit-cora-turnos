@@ -8376,6 +8376,24 @@ function armarPlanilla(datos, manual, desde) {
 
 function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
   const P = useMemo(() => armarPlanilla(datos, manual, desde), [datos, manual, desde]);
+  // La tabla tiene un ancho fijo y se escala para caber SIEMPRE completa en el
+  // ancho disponible (sin barra de desplazamiento horizontal).
+  const wrapRef = useRef(null);
+  const tabRef = useRef(null);
+  const [esc, setEsc] = useState({ k: 1, h: null });
+  useEffect(() => {
+    const fit = () => {
+      const w = wrapRef.current?.clientWidth, t = tabRef.current;
+      if (!w || !t) return;
+      const k = Math.min(1, w / t.offsetWidth);
+      setEsc((prev) => (Math.abs(prev.k - k) < 0.001 && prev.h === t.offsetHeight * k ? prev : { k, h: t.offsetHeight * k }));
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    if (wrapRef.current) ro.observe(wrapRef.current);
+    window.addEventListener("beforeprint", fit);
+    return () => { ro.disconnect(); window.removeEventListener("beforeprint", fit); };
+  }, [P]);
   const f0 = (v) => (v ? fmtNum(v, 0) : "-");
   const pct = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "0%");
   const th = "border border-slate-300 bg-sky-200 text-slate-900 font-bold px-1 py-1 text-center";
@@ -8383,8 +8401,12 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
   const lab = "border border-slate-200 px-1.5 py-[2px] text-left whitespace-nowrap sticky left-0 bg-white";
   const nDias = P.fechas.length;
   return (
-    <div className="overflow-x-auto rep-planilla">
-      <table className="text-[10px] leading-tight border-collapse min-w-full">
+    <div ref={wrapRef} className="rep-planilla w-full overflow-hidden" style={{ height: esc.h ?? undefined }}>
+      <table ref={tabRef} className="text-[10px] leading-tight border-collapse" style={{ width: 1000, tableLayout: "fixed", transform: `scale(${esc.k})`, transformOrigin: "top left" }}>
+        <colgroup>
+          <col style={{ width: 154 }} />
+          {Array.from({ length: nDias * 3 }).map((_, i) => <col key={i} style={{ width: 41 }} />)}
+        </colgroup>
         <thead>
           <tr>
             <th className={`${th} sticky left-0 text-left`} rowSpan={2}>Semana {fmtCorto(P.fechas[0])} – {fmtCorto(P.fechas[nDias - 1])}</th>
@@ -8457,7 +8479,7 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
 
           <tr className="font-bold bg-sky-200">
             <td className={`${lab} bg-sky-200`}>Envasado (cajas)</td>
-            {P.fechas.map((f) => ["Plan", "Real", "%Cumpl."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
+            {P.fechas.map((f) => ["Plan", "Real", "%Cum."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
           </tr>
           {P.envasado.map((e) => (
             <tr key={e.turno}>
