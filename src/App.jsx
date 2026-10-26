@@ -950,6 +950,24 @@ function especieDeProceso(lineaKey, proceso) {
 // para los demás se usa la lista "tipos-proceso" que edita el Jefe (por defecto
 // Selección). Se llena en App() igual que PROCESOS_EXTRA_MOD.
 const TIPOS_PROCESO = ["Selección", "Spot", "Apertura"];
+const TIPOS_PROCESO_COLORES = { "Selección": "#7c3aed", "Spot": "#f59e0b", "Apertura": "#0ea5e9" };
+
+// Kg ingresados y rendimiento por día de UN tipo de proceso (todas las líneas).
+function serieDiariaTipo(registros, desde, hasta, tipo) {
+  const dia = (rs) => {
+    let ing = 0, apr = 0;
+    rs.forEach((r) => kgPorProcesoEspecie(r).forEach((x) => { if (x.tipo === tipo) { ing += x.ing; apr += x.apr; } }));
+    return { ing, apr };
+  };
+  const diarioIng = [], diarioRend = [];
+  for (let f = desde; f <= hasta; f = sumarDias(f, 1)) {
+    const t = dia(registros.filter((r) => r.fecha === f));
+    diarioIng.push({ fecha: f, label: fmtCorto(f), valor: t.ing > 0 ? t.ing : null });
+    diarioRend.push({ fecha: f, label: fmtCorto(f), valor: t.ing > 0 ? t.apr / t.ing : null });
+  }
+  const tot = dia(registros);
+  return { tipo, ing: tot.ing, apr: tot.apr, rend: tot.ing ? tot.apr / tot.ing : null, diarioIng, diarioRend };
+}
 let TIPOS_PROCESO_MOD = [];
 function tipoDeProceso(lineaKey, proceso) {
   const o = TIPOS_PROCESO_MOD.find((x) => x.lineaKey === lineaKey && x.proceso === proceso);
@@ -7547,6 +7565,7 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   const selEspKeys = [...new Set(selProcEsp.map((x) => x.especie))];
   const selEspColores = {};
   selEspKeys.forEach((e, i) => { selEspColores[e] = SERIES_COLORS[i % SERIES_COLORS.length]; });
+  const selTipos = TIPOS_PROCESO.map((t) => serieDiariaTipo(sel, desde, hasta, t));
   const selDiarioEsp = [];
   for (let f = desde; f <= hasta; f = sumarDias(f, 1)) {
     const fila = { label: fmtCorto(f) };
@@ -7619,7 +7638,7 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
     lavado: { tiposTabla: lavTiposTabla, total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
     seleccion: {
       ing: selIng, apr: selApr, prog: selProg, rend: selRend, cump: selCump, lineas: selLineas,
-      procEsp: selProcEsp, espKeys: selEspKeys, espColores: selEspColores, diarioEsp: selDiarioEsp,
+      procEsp: selProcEsp, espKeys: selEspKeys, espColores: selEspColores, diarioEsp: selDiarioEsp, tipos: selTipos,
     },
     envasado: {
       cajasProd, cajasProg,
@@ -7958,6 +7977,24 @@ function ParetoDetenciones({ items, total }) {
   );
 }
 
+// Filtro de fechas propio de una sección de Indicadores generales (vacío = período general).
+function FiltroSeccion({ k, filtro }) {
+  const { rangos, setRango, desde, hasta } = filtro;
+  const rg = rangos[k];
+  const d = rg?.desde ?? desde, h = rg?.hasta ?? hasta;
+  const cls = "border border-slate-300 rounded-lg px-2 py-1 text-xs bg-white";
+  return (
+    <div className="no-print flex flex-wrap items-center gap-2 rounded-lg bg-slate-50 border border-slate-200 px-2.5 py-2">
+      <span className="text-[11px] font-semibold text-slate-600">Fechas</span>
+      <input type="date" style={{ colorScheme: "light" }} className={cls} value={d} max={h} onChange={(e) => e.target.value && setRango(k, { desde: e.target.value, hasta: h })} />
+      <span className="text-slate-400 text-xs">–</span>
+      <input type="date" style={{ colorScheme: "light" }} className={cls} value={h} min={d} onChange={(e) => e.target.value && setRango(k, { desde: d, hasta: e.target.value })} />
+      {rg
+        ? <button type="button" onClick={() => setRango(k, null)} className="text-[11px] text-blue-600 underline">Usar período general</button>
+        : <span className="text-[11px] text-slate-400">período general</span>}
+    </div>
+  );
+}
 function SeccionArea({ titulo, color, children, salto }) {
   return (
     <div className={`${salto ? "rep-salto " : ""}rounded-2xl border border-slate-200 bg-white overflow-hidden`}>
@@ -8058,12 +8095,18 @@ function ListaEventos({ eventos }) {
 
 // Panel de indicadores: es lo que se ve en la pantalla Y lo que va en el PDF.
 // `svg` = true en el reporte (gráficos que se escalan al ancho de la hoja).
-function PanelIndicadores({ r, p, svg }) {
+// Cada sección puede tener su propio rango de fechas (ovr[sección] = { r, p });
+// el resumen ejecutivo de arriba siempre usa el período general (r, p).
+function PanelIndicadores({ r, p, svg, ovr, filtro }) {
   const cerrados = r.turnosCerrados.lavado + r.turnosCerrados.seleccion + r.turnosCerrados.envasado;
-  const lineasSel = r.seleccion.lineas
-    .map((l, i) => ({ l, prev: p.seleccion.lineas[i] }))
+  const SECS = ["lavado", "seleccion", "envasado", "seguridad"];
+  const rE = { ...r }, pE = { ...p };
+  SECS.forEach((k) => { if (ovr?.[k]) { rE[k] = ovr[k].r[k]; pE[k] = ovr[k].p[k]; } });
+  const lineasSel = rE.seleccion.lineas
+    .map((l, i) => ({ l, prev: pE.seleccion.lineas[i] }))
     .filter(({ l }) => l.ing > 0 || l.apr > 0 || l.prog > 0);
-  const sg = r.seguridad.supervisores;
+  const sg = rE.seguridad.supervisores;
+  const filtroDe = (k) => (filtro && !svg ? <FiltroSeccion k={k} filtro={filtro} /> : null);
 
   return (
     <div className="space-y-4">
@@ -8087,31 +8130,46 @@ function PanelIndicadores({ r, p, svg }) {
 
       {/* ---------- Lavado ---------- */}
       <SeccionArea titulo="Lavado de bandejas" color="#2563eb">
+        {filtroDe("lavado")}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <Kpi label="Pallets lavados" valor={r.lavado.total} actual={r.lavado.total} previo={p.lavado.total} />
-          <Kpi label="Promedio por turno" tipo="num1" valor={r.lavado.promedio} actual={r.lavado.promedio} previo={p.lavado.promedio} />
+          <Kpi label="Pallets lavados" valor={rE.lavado.total} actual={rE.lavado.total} previo={pE.lavado.total} />
+          <Kpi label="Promedio por turno" tipo="num1" valor={rE.lavado.promedio} actual={rE.lavado.promedio} previo={pE.lavado.promedio} />
           <Kpi label="Turnos cerrados" valor={r.turnosCerrados.lavado} actual={r.turnosCerrados.lavado} previo={p.turnosCerrados.lavado} />
         </div>
         <SubBloque titulo="Pallets lavados por tipo de bandeja" color="#2563eb">
-          <TablaLavadoTipos rows={r.lavado.tiposTabla} />
+          <TablaLavadoTipos rows={rE.lavado.tiposTabla} />
         </SubBloque>
-        <GraficoApiladoTipos svg={svg} titulo="Pallets lavados por día, según tipo de bandeja" data={r.lavado.diarioTipos} keys={r.lavado.tiposKeys} colores={r.lavado.colores} vacio="Sin pallets lavados en el período." />
-        <PendientesLavado pend={r.lavado.pendientes} turnosSel={r.turnosSel} svg={svg} />
+        <GraficoApiladoTipos svg={svg} titulo="Pallets lavados por día, según tipo de bandeja" data={rE.lavado.diarioTipos} keys={rE.lavado.tiposKeys} colores={rE.lavado.colores} vacio="Sin pallets lavados en el período." />
+        <PendientesLavado pend={rE.lavado.pendientes} turnosSel={r.turnosSel} svg={svg} />
       </SeccionArea>
 
       {/* ---------- Selección: total y una sección por línea ---------- */}
       <SeccionArea titulo="Selección" color="#7c3aed" salto>
+        {filtroDe("seleccion")}
         <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Total Selección</p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <Kpi label="Kg ingresados" valor={r.seleccion.ing} actual={r.seleccion.ing} previo={p.seleccion.ing} />
-          <Kpi label="Kg aprobados" valor={r.seleccion.apr} actual={r.seleccion.apr} previo={p.seleccion.apr} />
-          <Kpi label="Rendimiento" tipo="pct" valor={r.seleccion.rend} actual={r.seleccion.rend} previo={p.seleccion.rend} />
-          <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={r.seleccion.cump} tono={tonoCumplimiento(r.seleccion.cump)} actual={r.seleccion.cump} previo={p.seleccion.cump} sub={r.seleccion.prog ? `${fmtNum(r.seleccion.prog)} Kg programados` : "Sin Kg programado"} />
+          <Kpi label="Kg ingresados" valor={rE.seleccion.ing} actual={rE.seleccion.ing} previo={pE.seleccion.ing} />
+          <Kpi label="Kg aprobados" valor={rE.seleccion.apr} actual={rE.seleccion.apr} previo={pE.seleccion.apr} />
+          <Kpi label="Rendimiento" tipo="pct" valor={rE.seleccion.rend} actual={rE.seleccion.rend} previo={pE.seleccion.rend} />
+          <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={rE.seleccion.cump} tono={tonoCumplimiento(rE.seleccion.cump)} actual={rE.seleccion.cump} previo={pE.seleccion.cump} sub={rE.seleccion.prog ? `${fmtNum(rE.seleccion.prog)} Kg programados` : "Sin Kg programado"} />
         </div>
         <SubBloque titulo="Kg ingresados por proceso y especie" color="#7c3aed">
-          <TablaProcesoEspecie rows={r.seleccion.procEsp} />
-          <GraficoApiladoTipos svg={svg} titulo="Kg ingresados por día, según especie" data={r.seleccion.diarioEsp} keys={r.seleccion.espKeys} colores={r.seleccion.espColores} vacio="Sin Kg ingresados en el período." />
+          <TablaProcesoEspecie rows={rE.seleccion.procEsp} />
+          <GraficoApiladoTipos svg={svg} titulo="Kg ingresados por día, según especie" data={rE.seleccion.diarioEsp} keys={rE.seleccion.espKeys} colores={rE.seleccion.espColores} vacio="Sin Kg ingresados en el período." />
         </SubBloque>
+        {rE.seleccion.tipos.map((t) => (
+          <SubBloque key={t.tipo} titulo={`Tipo de proceso: ${t.tipo}`} color={TIPOS_PROCESO_COLORES[t.tipo]}>
+            <div className="grid grid-cols-3 gap-2">
+              <Kpi label="Kg ingresados" valor={t.ing} />
+              <Kpi label="Kg aprobados" valor={t.apr} />
+              <Kpi label="Rendimiento" tipo="pct" valor={t.rend} />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <GraficoDiario svg={svg} titulo="Kg ingresados por día" data={t.diarioIng} mitad color={TIPOS_PROCESO_COLORES[t.tipo]} />
+              <GraficoDiario svg={svg} titulo="Rendimiento por día" data={t.diarioRend} mitad formato="pct" color={TIPOS_PROCESO_COLORES[t.tipo]} />
+            </div>
+          </SubBloque>
+        ))}
         {lineasSel.length === 0 && <EmptyNote text="Sin cierres de Selección en el período." />}
         {lineasSel.map(({ l, prev }, i) => (
           <SubBloque key={l.key} titulo={l.label} color={SERIES_COLORS[i % SERIES_COLORS.length]}>
@@ -8131,55 +8189,57 @@ function PanelIndicadores({ r, p, svg }) {
 
       {/* ---------- Envasado: Envasadora y Línea 5 por separado ---------- */}
       <SeccionArea titulo="Envasado" color="#059669" salto>
+        {filtroDe("envasado")}
         <SubBloque titulo="Envasadora" color="#10b981">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            <Kpi label="Cajas producidas" valor={r.envasado.cajasProd} actual={r.envasado.cajasProd} previo={p.envasado.cajasProd} />
-            <Kpi label="Cajas programadas" valor={r.envasado.cajasProg} />
-            <Kpi label="Cumplimiento" tipo="pct" valor={r.envasado.cump} tono={tonoCumplimiento(r.envasado.cump)} actual={r.envasado.cump} previo={p.envasado.cump} />
-            <Kpi label="Productividad" tipo="num1" unidad="bolsas/min" valor={r.envasado.productividad} actual={r.envasado.productividad} previo={p.envasado.productividad} />
-            <Kpi label="Tiempo efectivo" valor={r.envasado.tiempoEfectivo} unidad="min" actual={r.envasado.tiempoEfectivo} previo={p.envasado.tiempoEfectivo} />
-            <Kpi label="Detenciones" valor={r.envasado.detTotal} unidad="min" actual={r.envasado.detTotal} previo={p.envasado.detTotal} menorEsMejor />
-            <Kpi label="Merma de cajas" tipo="pct" valor={r.envasado.mermaCajas} actual={r.envasado.mermaCajas} previo={p.envasado.mermaCajas} menorEsMejor />
-            <Kpi label="Merma de bolsas" tipo="pct" valor={r.envasado.mermaBolsas} actual={r.envasado.mermaBolsas} previo={p.envasado.mermaBolsas} menorEsMejor />
+            <Kpi label="Cajas producidas" valor={rE.envasado.cajasProd} actual={rE.envasado.cajasProd} previo={pE.envasado.cajasProd} />
+            <Kpi label="Cajas programadas" valor={rE.envasado.cajasProg} />
+            <Kpi label="Cumplimiento" tipo="pct" valor={rE.envasado.cump} tono={tonoCumplimiento(rE.envasado.cump)} actual={rE.envasado.cump} previo={pE.envasado.cump} />
+            <Kpi label="Productividad" tipo="num1" unidad="bolsas/min" valor={rE.envasado.productividad} actual={rE.envasado.productividad} previo={pE.envasado.productividad} />
+            <Kpi label="Tiempo efectivo" valor={rE.envasado.tiempoEfectivo} unidad="min" actual={rE.envasado.tiempoEfectivo} previo={pE.envasado.tiempoEfectivo} />
+            <Kpi label="Detenciones" valor={rE.envasado.detTotal} unidad="min" actual={rE.envasado.detTotal} previo={pE.envasado.detTotal} menorEsMejor />
+            <Kpi label="Merma de cajas" tipo="pct" valor={rE.envasado.mermaCajas} actual={rE.envasado.mermaCajas} previo={pE.envasado.mermaCajas} menorEsMejor />
+            <Kpi label="Merma de bolsas" tipo="pct" valor={rE.envasado.mermaBolsas} actual={rE.envasado.mermaBolsas} previo={pE.envasado.mermaBolsas} menorEsMejor />
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <GraficoDiario svg={svg} titulo="Cajas producidas por día" mitad data={r.envasado.diarioCajas} color="#34d399" />
-            <GraficoDiario svg={svg} titulo="Cumplimiento por día" mitad data={r.envasado.diarioCump} formato="pct" color="#10b981" />
+            <GraficoDiario svg={svg} titulo="Cajas producidas por día" mitad data={rE.envasado.diarioCajas} color="#34d399" />
+            <GraficoDiario svg={svg} titulo="Cumplimiento por día" mitad data={rE.envasado.diarioCump} formato="pct" color="#10b981" />
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <GraficoLinea svg={svg} titulo="Merma de cajas por día" mitad data={r.envasado.diarioMermaCajas} color="#f59e0b" />
-            <GraficoLinea svg={svg} titulo="Merma de bolsas por día" mitad data={r.envasado.diarioMermaBolsas} color="#ef4444" />
+            <GraficoLinea svg={svg} titulo="Merma de cajas por día" mitad data={rE.envasado.diarioMermaCajas} color="#f59e0b" />
+            <GraficoLinea svg={svg} titulo="Merma de bolsas por día" mitad data={rE.envasado.diarioMermaBolsas} color="#ef4444" />
           </div>
           <div className="rep-bloque">
             <p className="text-xs font-semibold text-slate-700 mb-2">Mermas por SKU producido</p>
-            <TablaMermaSku rows={r.envasado.mermaSku} />
+            <TablaMermaSku rows={rE.envasado.mermaSku} />
           </div>
           <div className="rep-bloque">
             <p className="text-xs font-semibold text-slate-700 mb-2">Detenciones por motivo (Pareto)</p>
-            <ParetoDetenciones items={r.envasado.detPareto} total={r.envasado.detTotal} />
+            <ParetoDetenciones items={rE.envasado.detPareto} total={rE.envasado.detTotal} />
           </div>
         </SubBloque>
 
         <SubBloque titulo="Línea 5" color="#0d9488">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            <Kpi label="Kg ingresados" valor={r.envasado.l5Ing} actual={r.envasado.l5Ing} previo={p.envasado.l5Ing} />
-            <Kpi label="Kg aprobados" valor={r.envasado.l5Apr} actual={r.envasado.l5Apr} previo={p.envasado.l5Apr} />
-            <Kpi label="Rendimiento" tipo="pct" valor={r.envasado.l5Rend} actual={r.envasado.l5Rend} previo={p.envasado.l5Rend} />
-            <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={r.envasado.l5Cump} tono={tonoCumplimiento(r.envasado.l5Cump)} actual={r.envasado.l5Cump} previo={p.envasado.l5Cump} sub={r.envasado.l5Prog ? `${fmtNum(r.envasado.l5Prog)} Kg programados` : "Sin Kg programado"} />
+            <Kpi label="Kg ingresados" valor={rE.envasado.l5Ing} actual={rE.envasado.l5Ing} previo={pE.envasado.l5Ing} />
+            <Kpi label="Kg aprobados" valor={rE.envasado.l5Apr} actual={rE.envasado.l5Apr} previo={pE.envasado.l5Apr} />
+            <Kpi label="Rendimiento" tipo="pct" valor={rE.envasado.l5Rend} actual={rE.envasado.l5Rend} previo={pE.envasado.l5Rend} />
+            <Kpi label="Cumplimiento vs. programa" tipo="pct" valor={rE.envasado.l5Cump} tono={tonoCumplimiento(rE.envasado.l5Cump)} actual={rE.envasado.l5Cump} previo={pE.envasado.l5Cump} sub={rE.envasado.l5Prog ? `${fmtNum(rE.envasado.l5Prog)} Kg programados` : "Sin Kg programado"} />
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <GraficoDiario svg={svg} titulo="Kg ingresados por día" data={r.envasado.l5DiarioIng} mitad color="#2dd4bf" />
-            <GraficoDiario svg={svg} titulo="Rendimiento por día" data={r.envasado.l5DiarioRend} mitad formato="pct" color="#0d9488" />
+            <GraficoDiario svg={svg} titulo="Kg ingresados por día" data={rE.envasado.l5DiarioIng} mitad color="#2dd4bf" />
+            <GraficoDiario svg={svg} titulo="Rendimiento por día" data={rE.envasado.l5DiarioRend} mitad formato="pct" color="#0d9488" />
           </div>
         </SubBloque>
       </SeccionArea>
 
       {/* ---------- Seguridad ---------- */}
       <SeccionArea titulo="Seguridad" color="#dc2626" salto>
+        {filtroDe("seguridad")}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <Kpi label="Cierres con incidentes" valor={r.seguridad.incidentes} tono={r.seguridad.incidentes ? "warn" : "ok"} actual={r.seguridad.incidentes} previo={p.seguridad.incidentes} menorEsMejor />
-          <Kpi label="Cierres con accidentes" valor={r.seguridad.accidentes} tono={r.seguridad.accidentes ? "bad" : "ok"} actual={r.seguridad.accidentes} previo={p.seguridad.accidentes} menorEsMejor />
-          <Kpi label="Documentación pendiente" valor={r.seguridad.docsPendientes} tono={r.seguridad.docsPendientes ? "bad" : "ok"} />
+          <Kpi label="Cierres con incidentes" valor={rE.seguridad.incidentes} tono={rE.seguridad.incidentes ? "warn" : "ok"} actual={rE.seguridad.incidentes} previo={pE.seguridad.incidentes} menorEsMejor />
+          <Kpi label="Cierres con accidentes" valor={rE.seguridad.accidentes} tono={rE.seguridad.accidentes ? "bad" : "ok"} actual={rE.seguridad.accidentes} previo={pE.seguridad.accidentes} menorEsMejor />
+          <Kpi label="Documentación pendiente" valor={rE.seguridad.docsPendientes} tono={rE.seguridad.docsPendientes ? "bad" : "ok"} />
           <Kpi label="Turnos sin cierre" valor={r.turnosSinCierreTotal} tono={r.turnosSinCierreTotal ? "warn" : "ok"} />
         </div>
 
@@ -8219,8 +8279,8 @@ function PanelIndicadores({ r, p, svg }) {
         </SubBloque>
 
         <div>
-          <p className="rep-titulo text-xs font-semibold text-slate-700 mb-2">Reporte de accidentes e incidentes ({r.seguridad.eventos.length})</p>
-          <ListaEventos eventos={r.seguridad.eventos} />
+          <p className="rep-titulo text-xs font-semibold text-slate-700 mb-2">Reporte de accidentes e incidentes ({rE.seguridad.eventos.length})</p>
+          <ListaEventos eventos={rE.seguridad.eventos} />
         </div>
       </SeccionArea>
     </div>
@@ -8534,6 +8594,9 @@ function JefeDashboard({ onBack }) {
   const [offset, setOffset] = useState(0);
   const [verReporte, setVerReporte] = useState(false);
   const [turnos, setTurnos] = useState(TODOS_LOS_TURNOS);
+  // Rango de fechas propio por sección (null = sigue el período general).
+  const [rangos, setRangos] = useState({});
+  const setRango = (k, v) => setRangos((prev) => ({ ...prev, [k]: v }));
 
   const loading = lavado.loading || seleccion.loading || envasado.loading || loadingP;
   const semana = semanaDe(sumarDias(today(), offset * 7));
@@ -8543,6 +8606,20 @@ function JefeDashboard({ onBack }) {
   const datos = filtrarDatosPorTurno({ lavado, seleccion, envasado, programas, horarios, supervisoresLista: supervisoresReg || [] }, turnos);
   const r = loading ? null : resumenPeriodo(datos, desde, hasta, turnos);
   const p = loading ? null : resumenPeriodo(datos, sumarDias(desde, -dias), sumarDias(desde, -1), turnos);
+
+  useEffect(() => { setRangos({}); }, [modo, offset]);
+  const ovr = {};
+  if (!loading) {
+    ["lavado", "seleccion", "envasado", "seguridad"].forEach((k) => {
+      const g = rangos[k];
+      if (!g || !g.desde || !g.hasta || g.desde > g.hasta) return;
+      const n = Math.round((parseIso(g.hasta) - parseIso(g.desde)) / 864e5) + 1;
+      ovr[k] = {
+        r: resumenPeriodo(datos, g.desde, g.hasta, turnos),
+        p: resumenPeriodo(datos, sumarDias(g.desde, -n), sumarDias(g.desde, -1), turnos),
+      };
+    });
+  }
 
   // El reporte siempre es de UNA semana (lunes a domingo): la semana seleccionada.
   const rSemana = loading ? null : (dias === 7 ? r : resumenPeriodo(datos, semana.desde, semana.hasta, turnos));
@@ -8565,7 +8642,7 @@ function JefeDashboard({ onBack }) {
               <span className="text-xs font-normal text-slate-300">· {fmtCorto(semana.desde)} al {fmtCorto(semana.hasta)}</span>
             </button>
 
-            <PanelIndicadores r={r} p={p} />
+            <PanelIndicadores r={r} p={p} ovr={ovr} filtro={{ rangos, setRango, desde, hasta }} />
 
             <p className="text-xs text-slate-500">
               Las variaciones comparan con el período anterior de igual duración. El color del cumplimiento es verde desde 95 %, ámbar desde 85 % y rojo bajo eso. Para editar o eliminar registros, entra al área y abre la pestaña «Registros».
