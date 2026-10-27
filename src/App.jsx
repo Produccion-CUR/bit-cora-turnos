@@ -1545,7 +1545,7 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries, horarios) {
   return lineas.join("\n");
 }
 
-function buildResumenWhatsappInicio(area, record) {
+function buildResumenWhatsappInicio(area, record, programaEntries) {
   const lineas = [
     `*Bitácora de Turnos – ${area.title}*`,
     `Inicio de turno`,
@@ -1556,7 +1556,7 @@ function buildResumenWhatsappInicio(area, record) {
   ];
   // Mismo orden que el cierre: dotación global, producción, materiales de piso.
   if (area.resumenCompletoInicio) {
-    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoInicio(record) || {};
+    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoInicio(record, programaEntries) || {};
     if (dotacion.length > 0) {
       lineas.push("*Dotación:*");
       dotacion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
@@ -6586,7 +6586,7 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
   return { dotacion, produccion, materiales };
 }
 
-function resumenEnvasadoInicioCompleto(r) {
+function resumenEnvasadoInicioCompleto(r, programaEntries) {
   const dotacion = [];
   DOTACION_GENERAL_ENVASADO.forEach((label, i) => {
     const v = num(r[`dg_${i}`]);
@@ -6601,9 +6601,16 @@ function resumenEnvasadoInicioCompleto(r) {
   if (r.activa_envasadora === "Sí") {
     const mat = r.envasadora_sku ? skuMaterial(r.envasadora_sku) : null;
     produccion.push(["Envasadora · SKU", r.envasadora_sku ? `${mat?.producto || "—"} (${r.envasadora_sku})` : "—"]);
+    // Cantidad programada (cajas) del turno según el Programa de producción.
+    const progEnv = (programaEntries || []).filter((p) => p.lineaKey === "envasadora" && p.especie !== "LAVADO");
+    const cajasProg = progEnv.reduce((a, p) => a + num(p.cantidad), 0);
+    produccion.push(["Envasadora · Programado", progEnv.length ? `${fmtNum(cajasProg)} cajas` : "Sin programa"]);
   }
   if (r.activa_linea5 === "Sí") {
     produccion.push(["Línea 5 · Especie", r.linea5_especie || "—"]);
+    const progL5 = (programaEntries || []).filter((p) => (p.lineaKey === "linea5" || p.linea === "linea5") && p.especie !== "LAVADO");
+    const kgProg = progL5.reduce((a, p) => a + num(p.cantidad), 0);
+    produccion.push(["Línea 5 · Programado", progL5.length ? `${fmtNum(kgProg)} Kg` : "Sin programa"]);
   }
   if (r.activa_envasadora !== "Sí" && r.activa_linea5 !== "Sí") produccion.push(["Líneas de trabajo", "Ninguna activa"]);
 
@@ -6937,7 +6944,7 @@ function InicioTab({ area, values, setField, editingId, onSaved, onCancelEdit, a
 
       {lastSaved && (
         <a
-          href={whatsappShareUrl(buildResumenWhatsappInicio(area, lastSaved))}
+          href={whatsappShareUrl(buildResumenWhatsappInicio(area, lastSaved, programas.filter((p) => p.fecha === lastSaved.fecha && p.turno === lastSaved.turno)))}
           target="_blank"
           rel="noopener noreferrer"
           className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 transition-colors"
