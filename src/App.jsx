@@ -5431,6 +5431,7 @@ function buildResumenProgramaDia(fecha, records, observaciones, programaLineas) 
 }
 
 function ProgramaProduccionScreen({ onBack }) {
+  const { getMat } = useSkuOverrides();
   const [records, saveRecords, loading] = useSharedList("programa-records");
   const [observaciones, saveObservaciones, loadingObs] = useSharedList("programa-observaciones");
   const { porLinea } = useProcesosExtra();
@@ -5649,15 +5650,16 @@ function ProgramaProduccionScreen({ onBack }) {
               const lineasDeCat = programaLineas.filter((l) => CATEGORIA_INSUMO_POR_LINEA[l.key] === cat);
               const lineasConEnt = lineasDeCat.filter((l) => lineasVista.some((x) => x.key === l.key) && slotsVista.some((s) => (entriesPorSlot[slotKey(s)] || []).some((e) => e.lineaKey === l.key)));
               const lineasSec = lineasConEnt.length > 0 ? lineasConEnt : lineasDeCat;
+              const anchoCol = cat === "envasado" ? 230 : 104; // en Envasado la celda lleva además bolsa y caja
               return (
               <Card key={cat} title={`Vista general de la semana · ${titulo}`}>
                 <div className="overflow-x-auto -mx-4 px-4">
-                  <table className="border-collapse text-[11px]" style={{ minWidth: `${90 + slotsVista.length * 104}px` }}>
+                  <table className="border-collapse text-[11px]" style={{ minWidth: `${90 + slotsVista.length * anchoCol}px` }}>
                     <thead>
                       <tr>
                         <th className="sticky left-0 z-10 bg-slate-100 border border-slate-300 px-2 py-1 text-left text-slate-600 min-w-[90px]">Línea</th>
                         {slotsVista.map((s, i) => (
-                          <th key={i} className="border border-slate-300 px-2 py-1 text-center min-w-[104px]">
+                          <th key={i} className="border border-slate-300 px-2 py-1 text-center" style={{ minWidth: anchoCol }}>
                             <div className="text-slate-800 font-semibold">{diaCorto(s.fecha)}</div>
                             <div className="text-slate-600">{turnoLabel(s.turno)}</div>
                             <div className="text-slate-500">{fmtFechaCorta(s.fecha)}</div>
@@ -5698,6 +5700,31 @@ function ProgramaProduccionScreen({ onBack }) {
                                 </td>
                               ))}
                             </tr>
+                            {linea.key === "envasadora" && [
+                              { k: "bolsa", label: "Bolsa", unidad: "bolsas" },
+                              { k: "caja", label: "Caja", unidad: "cajas" },
+                            ].map((fila) => (
+                              <tr key={fila.k}>
+                                <td className={`sticky left-0 z-10 ${cc.label} border border-slate-300 px-2 py-1 font-semibold`}>{fila.label}</td>
+                                {filaEntries.map((es, i) => {
+                                  const items = es.filter((e) => e.especie !== "LAVADO").map((e) => ({ e, m: getMat(e.especie) })).filter((x) => x.m);
+                                  return (
+                                    <td key={i} className={`${cc.cell} border border-slate-300 px-1.5 py-1 align-top`}>
+                                      {items.length === 0 ? <span className="text-slate-400">—</span> : items.map(({ e, m }) => {
+                                        const cajas = num(e.cantidad);
+                                        const cant = fila.k === "bolsa" ? cajas * num(m.bolsasXCaja) : cajas;
+                                        return (
+                                          <div key={e.id} className="flex items-start justify-between gap-2 mb-0.5 leading-tight text-slate-800">
+                                            <span><b>{fila.k === "bolsa" ? m.codBolsa : m.codCaja}</b> · {fila.k === "bolsa" ? m.nomBolsa : m.nomCaja}</span>
+                                            <span className="font-semibold text-slate-900 whitespace-nowrap">{fmtNum(cant)} {fila.unidad}</span>
+                                          </div>
+                                        );
+                                      })}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
                           </React.Fragment>
                         );
                       })}
