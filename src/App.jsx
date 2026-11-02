@@ -705,6 +705,7 @@ const TIPOS_BANDEJA = [
   { key: "b055", label: "Bandejas 055 (Bandeja Bajo Peso)", factor: 100 },
   { key: "bmec", label: "Bandeja Mecanizada", factor: 100 },
   { key: "b053", label: "Bandejas 053 (Bandeja 3/4)", factor: 55 },
+  { key: "bproc", label: "Bandeja de proceso", factor: 50 },
   { key: "totes", label: "Totes", factor: 80 },
   { key: "bins", label: "Bins", factor: 1 },
 ].map((t) => ({ ...t, factorBase: t.factor }));
@@ -8718,8 +8719,95 @@ function JefeDashboard({ onBack }) {
 // Reporte semanal (se abre en pantalla y se guarda como PDF con «Imprimir»).
 // Es el mismo panel de la pantalla de Indicadores, con encabezado y comentarios.
 // ---------------------------------------------------------------------------
+// En el celular (y en la app instalada) window.print() no hace nada, así que el
+// PDF se genera dentro de la app con html2pdf.js (se descarga al tocar el botón
+// la primera vez, desde internet) y se descarga/comparte como archivo.
+function cargarHtml2Pdf() {
+  return new Promise((resolve, reject) => {
+    if (window.html2pdf) return resolve(window.html2pdf);
+    const sc = document.createElement("script");
+    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
+    sc.onload = () => (window.html2pdf ? resolve(window.html2pdf) : reject(new Error("No se pudo iniciar el generador de PDF.")));
+    sc.onerror = () => reject(new Error("No se pudo cargar el generador de PDF. Revisa tu conexión a internet e inténtalo de nuevo."));
+    document.head.appendChild(sc);
+  });
+}
+const esDispositivoMovil = () => {
+  try {
+    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+      || (navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform))
+      || window.matchMedia("(display-mode: standalone)").matches;
+  } catch { return false; }
+};
+
 function ReporteSemanalModal({ r, p, datos, manual, onClose }) {
   const ahora = fmtDateTime(new Date().toISOString());
+  const [generando, setGenerando] = useState(false);
+  const [errPdf, setErrPdf] = useState("");
+
+  const guardarPdf = async () => {
+    if (!esDispositivoMovil()) { window.print(); return; }
+    setErrPdf(""); setGenerando(true);
+    let restaurar = () => {};
+    try {
+      const html2pdf = await cargarHtml2Pdf();
+      const el = document.getElementById("reporte-print");
+      el.closest(".reporte-portal")?.scrollTo(0, 0);
+      // El PDF se arma con el ancho útil de una hoja A4 (198 mm ≈ 748 px) y con las
+      // grillas de varias columnas (como en computador) aunque la pantalla sea
+      // angosta; al terminar se restaura el tamaño normal.
+      const estilo = { w: el.style.width, mw: el.style.maxWidth, m: el.style.margin };
+      el.style.width = "748px"; el.style.maxWidth = "748px"; el.style.margin = "0";
+      el.classList.add("pdf-capture");
+      restaurar = () => { el.style.width = estilo.w; el.style.maxWidth = estilo.mw; el.style.margin = estilo.m; el.classList.remove("pdf-capture"); };
+      await new Promise((ok) => setTimeout(ok, 700)); // deja que las tablas/gráficos se reacomoden
+      // Los gráficos SVG se fijan en píxeles: html2canvas los dibuja mal con ancho "100 %".
+      const svgs = [...el.querySelectorAll("svg")].map((sv) => {
+        const rc = sv.getBoundingClientRect();
+        const prev = { w: sv.getAttribute("width"), h: sv.getAttribute("height") };
+        if (rc.width > 0 && rc.height > 0) { sv.setAttribute("width", String(Math.round(rc.width))); sv.setAttribute("height", String(Math.round(rc.height))); }
+        return { sv, prev };
+      });
+      const restaurarEstilo = restaurar;
+      restaurar = () => {
+        svgs.forEach(({ sv, prev }) => {
+          prev.w == null ? sv.removeAttribute("width") : sv.setAttribute("width", prev.w);
+          prev.h == null ? sv.removeAttribute("height") : sv.setAttribute("height", prev.h);
+        });
+        restaurarEstilo();
+      };
+      const w = 748, h = el.scrollHeight;
+      // Limita los píxeles totales para no pasarse del máximo de memoria del celular.
+      const scale = Math.max(0.8, Math.min(2, Math.sqrt(14e6 / (w * h))));
+      const nombre = `Reporte_semanal_${r.desde}_${r.hasta}.pdf`;
+      const worker = html2pdf().set({
+        margin: [8, 6, 8, 6],
+        filename: nombre,
+        image: { type: "jpeg", quality: 0.92 },
+        html2canvas: { scale, useCORS: true, backgroundColor: "#ffffff", scrollX: 0, scrollY: 0 },
+        jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+        pagebreak: { mode: ["css", "legacy"], before: [".rep-salto", ".rep-horizontal"], avoid: [".rep-bloque"] },
+      }).from(el);
+      const blob = await worker.outputPdf("blob");
+      const file = new File([blob], nombre, { type: "application/pdf" });
+      // Si el celular permite compartir archivos se abre el menú de compartir; si no, se descarga.
+      let compartido = false;
+      try {
+        if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: nombre }); compartido = true; }
+      } catch (e) { if (e && e.name === "AbortError") compartido = true; }
+      if (!compartido) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = nombre; document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      }
+    } catch (e) {
+      setErrPdf(e?.message || "No se pudo generar el PDF.");
+    } finally {
+      restaurar();
+      setGenerando(false);
+    }
+  };
   const H2 = "text-[13px] font-bold text-slate-900 border-b-2 border-slate-800 pb-1 mb-2 mt-5";
 
   return createPortal(
@@ -8739,17 +8827,24 @@ function ReporteSemanalModal({ r, p, datos, manual, onClose }) {
           @page horiz { size: A4 landscape; margin: 8mm; }
           .rep-horizontal { page: horiz; break-before: page; }
         }
+        /* Al generar el PDF en el celular se fuerza el diseño de varias columnas. */
+        .pdf-capture .md\\:grid-cols-2, .pdf-capture .sm\\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .pdf-capture .sm\\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .pdf-capture .md\\:grid-cols-4, .pdf-capture .sm\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       `}</style>
 
       <div className="no-print sticky top-0 z-10 flex items-center justify-between gap-2 bg-slate-900 text-white px-4 py-2.5">
         <button onClick={onClose} className="flex items-center gap-1.5 text-sm hover:underline"><X size={16} /> Cerrar</button>
-        <button onClick={() => window.print()} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 font-semibold text-sm rounded-lg px-4 py-2">
-          <Printer size={16} /> Imprimir / Guardar como PDF
+        <button onClick={guardarPdf} disabled={generando} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 font-semibold text-sm rounded-lg px-4 py-2">
+          {generando ? <Loader2 size={16} className="animate-spin" /> : <Printer size={16} />} {generando ? "Generando PDF…" : "Imprimir / Guardar como PDF"}
         </button>
       </div>
       <p className="no-print text-center text-xs text-slate-600 px-4 pt-3">
-        En el cuadro de impresión elige «Guardar como PDF» como destino y luego compártelo.
+        {esDispositivoMovil()
+          ? "En el celular el PDF se genera y se descarga (o se abre el menú para compartirlo). La primera vez necesita internet."
+          : "En el cuadro de impresión elige «Guardar como PDF» como destino y luego compártelo."}
       </p>
+      {errPdf && <p className="no-print text-center text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg mx-4 mt-2 px-3 py-2">{errPdf}</p>}
 
       <div id="reporte-print" className="bg-slate-50 text-slate-900 max-w-[820px] mx-auto my-3 p-5 shadow text-[11.5px] leading-snug">
         <div className="rep-bloque flex items-start justify-between rounded-2xl bg-slate-900 text-white px-5 py-4 mb-4">
