@@ -1318,6 +1318,16 @@ const ENVASADORA_SKUS = SKU_MATERIALES.map((s) => [s.sku, s.producto]);
 // del Google Sheet). Se llena una vez al cargar la app — ver App() más abajo.
 // skuMaterial() revisa primero el maestro hardcodeado y después este registro.
 let SKU_NUEVOS = [];
+// SKU nuevos de dos orígenes: los anotados a mano en la pestaña del Sheet
+// (SKU_HOJA) y los creados desde la app en "Editar especificación" (SKU_APP,
+// clave "sku-app"). SKU_NUEVOS es la unión; si un código está en ambos, manda
+// el de la app.
+let SKU_HOJA = [];
+let SKU_APP = [];
+function recalcularSkuNuevos() {
+  const delApp = new Set(SKU_APP.map((s) => s.sku));
+  SKU_NUEVOS = [...SKU_HOJA.filter((s) => !delApp.has(s.sku)), ...SKU_APP];
+}
 
 function skuMaterial(sku) {
   return SKU_MATERIALES.find((s) => s.sku === sku) || SKU_NUEVOS.find((s) => s.sku === sku) || null;
@@ -3181,7 +3191,51 @@ function EspecificacionEditScreen({ onBack }) {
   const [dirty,   setDirty]   = useState(false);
   const [toast,   setToast]   = useState(null);
 
-  const matBase = skuSel ? SKU_MATERIALES.find((s) => s.sku === skuSel) : null;
+  // --- SKU nuevos creados desde la app (clave "sku-app") ---
+  const [skusApp, saveSkusApp] = useSharedList("sku-app");
+  const [nuevoAbierto, setNuevoAbierto] = useState(false);
+  const [nuevo, setNuevo] = useState({});
+  const [toastNuevo, setToastNuevo] = useState(null);
+  const setNuevoCampo = (key, val) => setNuevo((p) => ({ ...p, [key]: val }));
+  const avisoNuevo = (kind, message) => { setToastNuevo({ kind, message }); setTimeout(() => setToastNuevo(null), 3500); };
+  const aplicarListaApp = (lista) => { SKU_APP = lista; recalcularSkuNuevos(); };
+
+  const crearSku = async () => {
+    const codigo = String(nuevo.sku || "").trim().toUpperCase();
+    const producto = String(nuevo.producto || "").trim();
+    if (!codigo) return avisoNuevo("error", "Escribe el código SKU.");
+    if (!producto) return avisoNuevo("error", "Escribe el nombre del producto.");
+    if (SKU_MATERIALES.some((s) => s.sku.toUpperCase() === codigo) || SKU_NUEVOS.some((s) => s.sku.toUpperCase() === codigo)) {
+      return avisoNuevo("error", `El SKU ${codigo} ya existe. Búscalo arriba para editarlo.`);
+    }
+    const fila = { sku: codigo };
+    CAMPOS_SKU.forEach(({ key, tipo }) => {
+      const v = String(nuevo[key] ?? "").trim();
+      fila[key] = tipo === "number" && v !== "" ? Number(v.replace(",", ".")) : v;
+    });
+    fila.producto = producto;
+    const lista = [...(skusApp || []), fila];
+    aplicarListaApp(lista);
+    const ok = await saveSkusApp(lista);
+    if (ok) {
+      avisoNuevo("ok", `SKU ${codigo} creado y disponible en Envasado.`);
+      setNuevo({}); setNuevoAbierto(false); setSkuSel(codigo);
+    } else {
+      avisoNuevo("error", "Se creó en este dispositivo pero no se pudo sincronizar. Vuelve a intentar con señal.");
+    }
+  };
+
+  const eliminarSkuApp = async (codigo) => {
+    if (typeof window !== "undefined" && window.confirm && !window.confirm(`¿Eliminar el SKU ${codigo}? Los registros ya guardados con este código no se borran.`)) return;
+    const lista = (skusApp || []).filter((s) => s.sku !== codigo);
+    aplicarListaApp(lista);
+    const ok = await saveSkusApp(lista);
+    await resetOverride(codigo);
+    if (skuSel === codigo) setSkuSel("");
+    avisoNuevo(ok ? "ok" : "error", ok ? `SKU ${codigo} eliminado.` : "No se pudo sincronizar la eliminación.");
+  };
+
+  const matBase = skuSel ? (SKU_MATERIALES.find((s) => s.sku === skuSel) || SKU_NUEVOS.find((s) => s.sku === skuSel) || null) : null;
   const matFull = skuSel ? getMat(skuSel) : null;
   const conOverride = skuSel ? tieneOverride(skuSel) : false;
 
@@ -3249,6 +3303,54 @@ function EspecificacionEditScreen({ onBack }) {
             <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5 mt-2">
               ⚠ Este SKU tiene modificaciones guardadas sobre el maestro original.
             </p>
+          )}
+        </Card>
+
+        <Card title="Agregar SKU nuevo">
+          {!nuevoAbierto ? (
+            <button onClick={() => setNuevoAbierto(true)}
+              className="w-full flex items-center justify-center gap-2 border-2 border-dashed border-amber-300 text-amber-700 hover:bg-amber-50 font-semibold rounded-xl py-2.5 text-sm">
+              <Plus size={16} /> Crear SKU de Envasado
+            </button>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="col-span-2">
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Código SKU *</label>
+                  <input className={inputBase} value={nuevo.sku ?? ""} onChange={(e) => setNuevoCampo("sku", e.target.value)} placeholder="Ej: T5-12-0500" />
+                </div>
+                {CAMPOS_SKU.map(({ key, label, tipo, ancho }) => (
+                  <div key={key} className={ancho || ""}>
+                    <label className="block text-xs font-medium text-slate-600 mb-1">{label}{key === "producto" ? " *" : ""}</label>
+                    <input type={tipo} inputMode={tipo === "number" ? "decimal" : undefined} step={tipo === "number" ? "any" : undefined}
+                      className={inputBase} value={nuevo[key] ?? ""} onChange={(e) => setNuevoCampo(key, e.target.value)} placeholder={`${label}…`} />
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={crearSku} className="flex-1 flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-white font-semibold rounded-xl py-3 text-sm">
+                  <Save size={16} /> Crear SKU
+                </button>
+                <button onClick={() => { setNuevoAbierto(false); setNuevo({}); }} className="px-4 rounded-xl border border-slate-300 text-slate-600 text-sm font-medium">Cancelar</button>
+              </div>
+            </div>
+          )}
+          {toastNuevo && <div className="mt-2"><Toast {...toastNuevo} /></div>}
+          {(skusApp || []).length > 0 && (
+            <div className="mt-3 border-t border-slate-100 pt-2">
+              <p className="text-xs text-slate-500 mb-1.5">SKU creados desde la app:</p>
+              <div className="space-y-1.5">
+                {(skusApp || []).map((s) => (
+                  <div key={s.sku} className="flex items-center justify-between gap-2 text-xs border border-slate-200 rounded-lg px-2.5 py-1.5">
+                    <button onClick={() => setSkuSel(s.sku)} className="text-left min-w-0">
+                      <span className="font-mono font-semibold text-amber-700">{s.sku}</span>
+                      <span className="text-slate-600 ml-1.5 truncate">{s.producto}</span>
+                    </button>
+                    <button onClick={() => eliminarSkuApp(s.sku)} className="text-red-500 hover:text-red-700 shrink-0" aria-label={`Eliminar ${s.sku}`}><Trash2 size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
         </Card>
 
@@ -9238,7 +9340,12 @@ export default function App() {
   // módulo ANTES de que rendericen los hijos, para que skuMaterial()/SkuPicker
   // ya los vean disponibles en este mismo render.
   const [skuNuevos] = useSharedList("sku-nuevos");
-  SKU_NUEVOS = skuNuevos || [];
+  const [skuAppState] = useSharedList("sku-app");
+  SKU_HOJA = skuNuevos || [];
+  // La caché compartida se actualiza al guardar desde el editor, así un
+  // re-render de App no pisa un SKU recién creado con una lista vieja.
+  SKU_APP = SHARED_LIST_CACHE.get("sku-app")?.value ?? skuAppState ?? [];
+  recalcularSkuNuevos();
   // Conversión "bandejas por pallet" editable desde el Google Sheet.
   const { items: procesosExtraApp } = useProcesosExtra();
   PROCESOS_EXTRA_MOD = procesosExtraApp || [];
