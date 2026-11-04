@@ -1108,14 +1108,16 @@ function agruparLavadoTipos(registros) {
     key: t.key, label: t.label, factor: t.factor,
     bandejas: registros.reduce((a, r) => a + num(r[`lavados_${t.key}_cant`]), 0),
     pallets: registros.reduce((a, r) => a + palletsValue(r, "lavados", t), 0),
-  })).filter((x) => x.pallets > 0 || x.bandejas > 0);
+    rotas: registros.reduce((a, r) => a + num(r[`lavados_${t.key}_rotas`]), 0),
+    palletsRotos: registros.reduce((a, r) => a + rotasPalletsValue(r, t), 0),
+  })).filter((x) => x.pallets > 0 || x.bandejas > 0 || x.rotas > 0);
   const tot = rows.reduce((a, x) => a + x.pallets, 0);
   return rows.map((x) => ({ ...x, pct: tot ? x.pallets / tot : 0 })).sort((a, b) => b.pallets - a.pallets);
 }
 
 function TablaLavadoTipos({ rows }) {
   if (!rows.length) return <EmptyNote text="Sin pallets lavados en el período." />;
-  const tot = rows.reduce((a, x) => ({ b: a.b + x.bandejas, p: a.p + x.pallets }), { b: 0, p: 0 });
+  const tot = rows.reduce((a, x) => ({ b: a.b + x.bandejas, p: a.p + x.pallets, r: a.r + x.rotas, pr: a.pr + x.palletsRotos }), { b: 0, p: 0, r: 0, pr: 0 });
   return (
     <div className="rep-bloque overflow-x-auto">
       <table className="w-full text-xs">
@@ -1126,6 +1128,8 @@ function TablaLavadoTipos({ rows }) {
             <th className="py-1 font-medium text-right">Band./pallet</th>
             <th className="py-1 font-medium text-right">Pallets</th>
             <th className="py-1 font-medium text-right">%</th>
+            <th className="py-1 font-medium text-right text-red-600">B. rotas</th>
+            <th className="py-1 font-medium text-right text-red-600">P. rotos</th>
           </tr>
         </thead>
         <tbody>
@@ -1136,6 +1140,8 @@ function TablaLavadoTipos({ rows }) {
               <td className="text-right">{x.factor > 0 ? fmtNum(x.factor) : "—"}</td>
               <td className="text-right font-semibold text-slate-800">{fmtNum(x.pallets, 1)}</td>
               <td className="text-right">{fmtPct(x.pct)}</td>
+              <td className="text-right text-red-700">{x.rotas ? fmtNum(x.rotas) : "—"}</td>
+              <td className="text-right text-red-700">{x.palletsRotos ? fmtNum(x.palletsRotos, 1) : "—"}</td>
             </tr>
           ))}
           <tr className="font-bold text-slate-900 border-t border-slate-300">
@@ -1144,6 +1150,8 @@ function TablaLavadoTipos({ rows }) {
             <td></td>
             <td className="text-right">{fmtNum(tot.p, 1)}</td>
             <td className="text-right">100%</td>
+            <td className="text-right text-red-700">{fmtNum(tot.r)}</td>
+            <td className="text-right text-red-700">{fmtNum(tot.pr, 1)}</td>
           </tr>
         </tbody>
       </table>
@@ -3936,6 +3944,16 @@ function palletsValue(values, prefix, tipo) {
   return num(values[`${prefix}_${tipo.key}_pallets`]);
 }
 
+// Bandejas rotas (solo cierre de Lavado): cantidad por tipo y pallets rotos,
+// calculados con el mismo factor "bandejas por pallet" (si el tipo no tiene
+// factor, p. ej. Bins, los pallets rotos se anotan a mano).
+function rotasPalletsValue(values, tipo) {
+  if (tipo.factor > 0) return Math.round((num(values[`lavados_${tipo.key}_rotas`]) / tipo.factor) * 10) / 10;
+  return num(values[`lavados_${tipo.key}_rotas_pallets`]);
+}
+const totalBandejasRotas = (values) => TIPOS_BANDEJA.reduce((a, t) => a + num(values[`lavados_${t.key}_rotas`]), 0);
+const totalPalletsRotos = (values) => Math.round(TIPOS_BANDEJA.reduce((a, t) => a + rotasPalletsValue(values, t), 0) * 10) / 10;
+
 function totalPalletsFromPrefix(values, prefix) {
   return TIPOS_BANDEJA.reduce((s, t) => s + palletsValue(values, prefix, t), 0);
 }
@@ -3967,6 +3985,52 @@ function BandejaTable({ values, setField, prefix, soloPallets }) {
           <span>Total pallets</span>
           <span>{totalPalletsManual(values, prefix)}</span>
         </div>
+      </div>
+    );
+  }
+
+  if (prefix === "lavados") {
+    const cols = "grid grid-cols-[minmax(0,1.5fr)_repeat(4,minmax(0,1fr))] gap-1.5 items-center";
+    const celdaAuto = "text-sm text-slate-700 px-2 py-2 bg-slate-100 rounded-lg border border-slate-300 min-h-[38px]";
+    const inpCh = inputBase + " !px-2";
+    return (
+      <div className="space-y-2">
+        <div className={cols + " text-[10px] font-semibold uppercase tracking-wide px-1 leading-tight"}>
+          <span className="text-slate-600">Tipo de bandeja</span>
+          <span className="text-slate-600">Bandejas lavadas</span>
+          <span className="text-slate-600">Pallets lavados</span>
+          <span className="text-red-600">Bandejas rotas</span>
+          <span className="text-red-600">Pallets rotos</span>
+        </div>
+        {TIPOS_BANDEJA.map((t) => (
+          <div key={t.key} className={cols}>
+            <span className="text-xs sm:text-sm text-slate-800 leading-tight">{t.label}</span>
+            <input type="number" min="0" className={inpCh} value={values[`lavados_${t.key}_cant`] ?? ""}
+              onChange={(e) => setField(`lavados_${t.key}_cant`, e.target.value)} />
+            {t.factor > 0 ? (
+              <div className={celdaAuto}>{palletsValue(values, prefix, t)}</div>
+            ) : (
+              <input type="number" min="0" step="any" className={inpCh} value={values[`lavados_${t.key}_pallets`] ?? ""}
+                onChange={(e) => setField(`lavados_${t.key}_pallets`, e.target.value)} />
+            )}
+            <input type="number" min="0" className={inpCh + " !border-red-300"} value={values[`lavados_${t.key}_rotas`] ?? ""}
+              onChange={(e) => setField(`lavados_${t.key}_rotas`, e.target.value)} />
+            {t.factor > 0 ? (
+              <div className={celdaAuto + " text-red-700"}>{rotasPalletsValue(values, t)}</div>
+            ) : (
+              <input type="number" min="0" step="any" className={inpCh + " !border-red-300"} value={values[`lavados_${t.key}_rotas_pallets`] ?? ""}
+                onChange={(e) => setField(`lavados_${t.key}_rotas_pallets`, e.target.value)} />
+            )}
+          </div>
+        ))}
+        <div className={cols + " text-sm font-semibold text-slate-800 px-1 pt-1 border-t border-slate-300"}>
+          <span>Total</span>
+          <span></span>
+          <span>{totalPalletsFromPrefix(values, prefix)}</span>
+          <span className="text-red-700">{totalBandejasRotas(values)}</span>
+          <span className="text-red-700">{totalPalletsRotos(values)}</span>
+        </div>
+        <p className="text-[11px] text-slate-400 px-1">Los pallets se calculan con las bandejas por pallet de cada tipo. Las rotas no se suman a los pallets lavados.</p>
       </div>
     );
   }
@@ -4005,22 +4069,6 @@ function BandejaTable({ values, setField, prefix, soloPallets }) {
         <span>Total pallets</span>
         <span>{totalPalletsFromPrefix(values, prefix)}</span>
       </div>
-      {prefix === "lavados" && (
-        <div className="pt-2 mt-1 border-t border-dashed border-red-200 space-y-2">
-          <div className="grid grid-cols-3 gap-2 items-center">
-            <span className="text-sm text-red-700 font-medium">Bandejas rotas</span>
-            <input type="number" min="0" className={inputBase} value={values.lavados_rotas_cant ?? ""}
-              onChange={(e) => setField("lavados_rotas_cant", e.target.value)} />
-            <span className="text-xs text-slate-400">No suman al total</span>
-          </div>
-          <div className="grid grid-cols-3 gap-2 items-center">
-            <span className="text-sm text-red-700 font-medium">Pallets rotos</span>
-            <input type="number" min="0" step="any" className={inputBase} value={values.lavados_rotas_pallets ?? ""}
-              onChange={(e) => setField("lavados_rotas_pallets", e.target.value)} />
-            <span className="text-xs text-slate-400">No suman al total</span>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -6593,8 +6641,15 @@ function resumenLavadoCierreCompleto(r, inicio) {
     if (v > 0) produccion.push([t.label, `${fmtNum(v)} pallets`, "plano"]);
   });
   produccion.push(["Total pallets lavados", fmtNum(totalPalletsFromPrefix(r, "lavados"))]);
-  if (num(r.lavados_rotas_cant) > 0) produccion.push(["Bandejas rotas", fmtNum(num(r.lavados_rotas_cant))]);
-  if (num(r.lavados_rotas_pallets) > 0) produccion.push(["Pallets rotos", fmtNum(num(r.lavados_rotas_pallets), 1)]);
+  if (totalBandejasRotas(r) > 0) {
+    produccion.push(["=", "Rotas"]);
+    TIPOS_BANDEJA.forEach((t) => {
+      const c = num(r[`lavados_${t.key}_rotas`]);
+      if (c > 0) produccion.push([t.label, `${fmtNum(c)} bandejas · ${fmtNum(rotasPalletsValue(r, t), 1)} pallets`, "plano"]);
+    });
+    produccion.push(["Total bandejas rotas", fmtNum(totalBandejasRotas(r))]);
+    produccion.push(["Total pallets rotos", fmtNum(totalPalletsRotos(r), 1)]);
+  }
   produccion.push(["=", "Pendientes"]);
   TIPOS_BANDEJA.forEach((t) => {
     const v = num(r[`pendientes_${t.key}_pallets`]);
@@ -7659,8 +7714,8 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   const lav = fusionados(lavado);
   const lavTotal = sumaPor(lav, (r) => totalPalletsFromPrefix(r, "lavados"));
   const lavTiposTabla = agruparLavadoTipos(lav);
-  const lavBandejasRotas = sumaPor(lav, (r) => num(r.lavados_rotas_cant));
-  const lavPalletsRotos = sumaPor(lav, (r) => num(r.lavados_rotas_pallets));
+  const lavBandejasRotas = sumaPor(lav, (r) => totalBandejasRotas(r));
+  const lavPalletsRotos = sumaPor(lav, (r) => totalPalletsRotos(r));
   const lavTipos = TIPOS_BANDEJA
     .map((t) => ({ key: t.key, label: t.label.replace(/\s*\(.*\)/, ""), valor: sumaPor(lav, (r) => palletsValue(r, "lavados", t)) }))
     .filter((t) => t.valor > 0);
