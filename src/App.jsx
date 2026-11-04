@@ -3322,8 +3322,12 @@ function EspecificacionEditScreen({ onBack }) {
                 {CAMPOS_SKU.map(({ key, label, tipo, ancho }) => (
                   <div key={key} className={ancho || ""}>
                     <label className="block text-xs font-medium text-slate-600 mb-1">{label}{key === "producto" ? " *" : ""}</label>
-                    <input type={tipo} inputMode={tipo === "number" ? "decimal" : undefined} step={tipo === "number" ? "any" : undefined}
-                      className={inputBase} value={nuevo[key] ?? ""} onChange={(e) => setNuevoCampo(key, e.target.value)} placeholder={`${label}…`} />
+                    {tipo === "textarea" ? (
+                      <textarea rows={3} className={inputBase + " font-mono"} value={nuevo[key] ?? ""} onChange={(e) => setNuevoCampo(key, e.target.value)} placeholder="Ej: CF 6 173 07 BEST IF USED BY…" />
+                    ) : (
+                      <input type={tipo} inputMode={tipo === "number" ? "decimal" : undefined} step={tipo === "number" ? "any" : undefined}
+                        className={inputBase} value={nuevo[key] ?? ""} onChange={(e) => setNuevoCampo(key, e.target.value)} placeholder={`${label}…`} />
+                    )}
                   </div>
                 ))}
               </div>
@@ -3367,13 +3371,22 @@ function EspecificacionEditScreen({ onBack }) {
                           <span className="ml-1.5 text-amber-600 font-semibold">✎ modificado</span>
                         )}
                       </label>
-                      <input
-                        type={tipo}
-                        className={inputBase + (String(campos[key] ?? "") !== String(matBase?.[key] ?? "") ? " border-amber-400 bg-amber-50" : "")}
-                        value={campos[key] ?? ""}
-                        onChange={(e) => setCampo(key, e.target.value)}
-                        placeholder={`${label}…`}
-                      />
+                      {tipo === "textarea" ? (
+                        <textarea
+                          rows={3}
+                          className={inputBase + " font-mono" + (String(campos[key] ?? "") !== String(matBase?.[key] ?? "") ? " border-amber-400 bg-amber-50" : "")}
+                          value={campos[key] ?? ""}
+                          onChange={(e) => setCampo(key, e.target.value)}
+                        />
+                      ) : (
+                        <input
+                          type={tipo}
+                          className={inputBase + (String(campos[key] ?? "") !== String(matBase?.[key] ?? "") ? " border-amber-400 bg-amber-50" : "")}
+                          value={campos[key] ?? ""}
+                          onChange={(e) => setCampo(key, e.target.value)}
+                          placeholder={`${label}…`}
+                        />
+                      )}
                       {String(campos[key] ?? "") !== String(matBase?.[key] ?? "") && (
                         <p className="text-xs text-slate-400 mt-0.5">
                           Original: {matBase?.[key] !== undefined && matBase?.[key] !== "" ? String(matBase[key]) : "—"}
@@ -3992,6 +4005,22 @@ function BandejaTable({ values, setField, prefix, soloPallets }) {
         <span>Total pallets</span>
         <span>{totalPalletsFromPrefix(values, prefix)}</span>
       </div>
+      {prefix === "lavados" && (
+        <div className="pt-2 mt-1 border-t border-dashed border-red-200 space-y-2">
+          <div className="grid grid-cols-3 gap-2 items-center">
+            <span className="text-sm text-red-700 font-medium">Bandejas rotas</span>
+            <input type="number" min="0" className={inputBase} value={values.lavados_rotas_cant ?? ""}
+              onChange={(e) => setField("lavados_rotas_cant", e.target.value)} />
+            <span className="text-xs text-slate-400">No suman al total</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 items-center">
+            <span className="text-sm text-red-700 font-medium">Pallets rotos</span>
+            <input type="number" min="0" step="any" className={inputBase} value={values.lavados_rotas_pallets ?? ""}
+              onChange={(e) => setField("lavados_rotas_pallets", e.target.value)} />
+            <span className="text-xs text-slate-400">No suman al total</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -4684,7 +4713,7 @@ function CodificacionCard({ sku }) {
   if (!sku) return null;
   const mat = skuMaterial(sku);
   if (!mat) return null;
-  const cod = mat.cliente ? CODIFICACION_POR_CLIENTE[mat.cliente] : null;
+  const cod = mat?.cliente ? CODIFICACION_POR_CLIENTE[mat.cliente] : null;
   return (
     <div className="border border-amber-300 bg-amber-50 rounded-lg p-3 space-y-2 text-sm">
       <p className="text-xs font-semibold text-amber-800 uppercase tracking-wide">Materiales y codificación — {sku}</p>
@@ -6564,6 +6593,8 @@ function resumenLavadoCierreCompleto(r, inicio) {
     if (v > 0) produccion.push([t.label, `${fmtNum(v)} pallets`, "plano"]);
   });
   produccion.push(["Total pallets lavados", fmtNum(totalPalletsFromPrefix(r, "lavados"))]);
+  if (num(r.lavados_rotas_cant) > 0) produccion.push(["Bandejas rotas", fmtNum(num(r.lavados_rotas_cant))]);
+  if (num(r.lavados_rotas_pallets) > 0) produccion.push(["Pallets rotos", fmtNum(num(r.lavados_rotas_pallets), 1)]);
   produccion.push(["=", "Pendientes"]);
   TIPOS_BANDEJA.forEach((t) => {
     const v = num(r[`pendientes_${t.key}_pallets`]);
@@ -7628,6 +7659,8 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   const lav = fusionados(lavado);
   const lavTotal = sumaPor(lav, (r) => totalPalletsFromPrefix(r, "lavados"));
   const lavTiposTabla = agruparLavadoTipos(lav);
+  const lavBandejasRotas = sumaPor(lav, (r) => num(r.lavados_rotas_cant));
+  const lavPalletsRotos = sumaPor(lav, (r) => num(r.lavados_rotas_pallets));
   const lavTipos = TIPOS_BANDEJA
     .map((t) => ({ key: t.key, label: t.label.replace(/\s*\(.*\)/, ""), valor: sumaPor(lav, (r) => palletsValue(r, "lavados", t)) }))
     .filter((t) => t.valor > 0);
@@ -7772,7 +7805,7 @@ function resumenPeriodo(datos, desde, hasta, turnosSel = TODOS_LOS_TURNOS) {
   return {
     desde, hasta, turnosSel,
     turnosCerrados: { lavado: lav.length, seleccion: sel.length, envasado: env.length },
-    lavado: { tiposTabla: lavTiposTabla, total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
+    lavado: { tiposTabla: lavTiposTabla, bandejasRotas: lavBandejasRotas, palletsRotos: lavPalletsRotos, total: lavTotal, promedio: lav.length ? lavTotal / lav.length : null, tipos: lavTipos, diario: lavDiario, diarioTipos: lavDiarioTipos, tiposKeys: lavTiposKeys, colores: lavColores, pendientes },
     seleccion: {
       ing: selIng, apr: selApr, prog: selProg, rend: selRend, cump: selCump, lineas: selLineas,
       procEsp: selProcEsp, espKeys: selEspKeys, espColores: selEspColores, diarioEsp: selDiarioEsp, tipos: selTipos,
@@ -8272,6 +8305,8 @@ function PanelIndicadores({ r, p, svg, ovr, filtro }) {
           <Kpi label="Pallets lavados" valor={rE.lavado.total} actual={rE.lavado.total} previo={pE.lavado.total} />
           <Kpi label="Promedio por turno" tipo="num1" valor={rE.lavado.promedio} actual={rE.lavado.promedio} previo={pE.lavado.promedio} />
           <Kpi label="Turnos cerrados" valor={r.turnosCerrados.lavado} actual={r.turnosCerrados.lavado} previo={p.turnosCerrados.lavado} />
+          <Kpi label="Bandejas rotas" menorEsMejor valor={rE.lavado.bandejasRotas} actual={rE.lavado.bandejasRotas} previo={pE.lavado.bandejasRotas} />
+          <Kpi label="Pallets rotos" menorEsMejor tipo="num1" valor={rE.lavado.palletsRotos} actual={rE.lavado.palletsRotos} previo={pE.lavado.palletsRotos} />
         </div>
         <SubBloque titulo="Pallets lavados por tipo de bandeja" color="#2563eb">
           <TablaLavadoTipos rows={rE.lavado.tiposTabla} />
