@@ -8598,7 +8598,21 @@ function armarPlanilla(datos, manual, desde) {
     });
     return { turno: t, dias };
   });
-  return { fechas, grupos, total, man, secciones, envasado };
+  // ---- Lavado de bandejas: pallets lavados / rotos por turno ----
+  const lav = fus(datos.lavado);
+  const lavado = ["T1", "T2", "T3"].map((t) => {
+    const dias = {};
+    fechas.forEach((f) => {
+      const rs = lav.filter((r) => r.fecha === f && r.turno === t);
+      dias[f] = {
+        lav: Math.round(sumaPor(rs, (r) => totalPalletsFromPrefix(r, "lavados")) * 10) / 10,
+        rot: Math.round(sumaPor(rs, (r) => totalPalletsRotos(r)) * 10) / 10,
+        hay: rs.length > 0,
+      };
+    });
+    return { turno: t, dias };
+  });
+  return { fechas, grupos, total, man, secciones, envasado, lavado };
 }
 
 function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
@@ -8730,6 +8744,36 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
                 <td key={f + "a"} className={td}>{f0(plan)}</td>,
                 <td key={f + "b"} className={td}>{f0(real)}</td>,
                 <td key={f + "c"} className={td}>{plan ? pct(real, plan) : "-"}</td>,
+              ];
+            })}
+          </tr>
+
+          <tr className="font-bold bg-sky-200">
+            <td className={`${lab} bg-sky-200`}>Lavado (pallets)</td>
+            {P.fechas.map((f) => ["Lavados", "Rotos", "%Rot."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
+          </tr>
+          {P.lavado.map((e) => (
+            <tr key={e.turno}>
+              <td className={lab}>Turno {e.turno.slice(1)}</td>
+              {P.fechas.map((f) => {
+                const d = e.dias[f];
+                return [
+                  <td key={f + "a"} className={td}>{d.hay ? fmtNum(d.lav, 1) : ""}</td>,
+                  <td key={f + "b"} className={`${td} text-red-700`}>{d.hay ? fmtNum(d.rot, 1) : ""}</td>,
+                  <td key={f + "c"} className={td}>{d.hay && d.lav + d.rot ? pct(d.rot, d.lav + d.rot) : ""}</td>,
+                ];
+              })}
+            </tr>
+          ))}
+          <tr className="font-bold bg-sky-100">
+            <td className={`${lab} bg-sky-100`}>Total</td>
+            {P.fechas.map((f) => {
+              const lv = P.lavado.reduce((s, e) => s + e.dias[f].lav, 0);
+              const rt = P.lavado.reduce((s, e) => s + e.dias[f].rot, 0);
+              return [
+                <td key={f + "a"} className={td}>{lv ? fmtNum(lv, 1) : "-"}</td>,
+                <td key={f + "b"} className={`${td} text-red-700`}>{rt ? fmtNum(rt, 1) : "-"}</td>,
+                <td key={f + "c"} className={td}>{lv + rt ? pct(rt, lv + rt) : "-"}</td>,
               ];
             })}
           </tr>
