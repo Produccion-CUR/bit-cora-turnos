@@ -241,7 +241,7 @@ const SHARED_TTL_MS = 20000; // 20 segundos
 // las arma leyendo/combinando otras pestañas (SKU y Procesos del Sheet), así
 // que quedan fuera del pedido agrupado de abajo y siguen pidiéndose una por
 // una con window.storage.get.
-const CLAVES_NO_AGRUPABLES = new Set(["sku-nuevos", "procesos-extra", "factores-bandeja"]);
+const CLAVES_NO_AGRUPABLES = new Set(["sku-nuevos", "procesos-extra", "factores-bandeja", "stock-entrega"]);
 
 // Agrupa en UNA sola petición HTTP todas las claves compartidas que varios
 // componentes piden "al mismo tiempo" (mismo ciclo de eventos) — por ejemplo
@@ -538,7 +538,7 @@ function horarioParaTurno(fecha, turno, horarios) {
 // hay lista todavía, permite texto libre directamente.
 function SupervisorSelect({ area, value, onChange, supervisoresList }) {
   const filtrados = (supervisoresList || []).filter(
-    (s) => s.area === area || s.area === "Ambas"
+    (s) => !area || s.area === area || s.area === "Ambas"
   );
   const estaEnLista = filtrados.some((s) => s.nombre === value);
 
@@ -1514,7 +1514,7 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries, horarios) {
   // producción (kg, rendimiento, cumplimiento), 3) materiales de piso, y
   // recién después los comentarios del cierre e incidentes/accidentes.
   if (area.resumenCompletoCierre) {
-    const { dotacion = [], produccion = [], materiales = [] } = area.resumenCompletoCierre(record, inicio, programaEntries, horarios) || {};
+    const { dotacion = [], produccion = [], consumidos = [], materiales = [], tituloMateriales } = area.resumenCompletoCierre(record, inicio, programaEntries, horarios) || {};
     if (dotacion.length > 0) {
       lineas.push("*Dotación:*");
       dotacion.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
@@ -1535,8 +1535,13 @@ function buildResumenWhatsapp(area, record, inicio, programaEntries, horarios) {
       });
       lineas.push("");
     }
+    if (consumidos.length > 0) {
+      lineas.push("*Insumos consumidos en el turno:*");
+      consumidos.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
+      lineas.push("");
+    }
     if (materiales.length > 0) {
-      lineas.push("*Materiales de Piso:*");
+      lineas.push(`*${tituloMateriales || "Materiales de Piso"}:*`);
       materiales.forEach(([label, value]) => lineas.push(`• ${label}: ${value ?? "—"}`));
       lineas.push("");
     }
@@ -6258,11 +6263,14 @@ function horaActualStr() {
 }
 
 // ---------------------------------------------------------------------------
-// REGISTRO CONTROL ENTREGA DE MATERIALES
-// Tabla de entrega de herramientas y equipos al inicio de turno, usada en
-// Selección y Envasado. Cada fila tiene: material, cantidad, quien entrega,
-// quien recibe y observaciones. El registro queda guardado y se puede
-// compartir por WhatsApp.
+// ENTREGA DE MATERIALES (botón propio en el inicio)
+// Cada área (Selección / Envasado) tiene un STOCK FIJO de herramientas y
+// equipos (balanzas, radios, transpaletas…). Al cambiar de turno, el
+// supervisor que entrega y el que recibe revisan cada artículo y lo marcan:
+// Cumple · Falta · Perdido · Dañado. Si no cumple, la observación es
+// obligatoria. El stock fijo vive en la pestaña "Stock Entrega Materiales
+// (Base de Datos)" del Google Sheet (clave "stock-entrega"), editable allí o
+// desde la app por el Jefe de producción.
 // ---------------------------------------------------------------------------
 const ITEMS_ENTREGA_DEFAULT = [
   "BALANZAS",
@@ -6278,269 +6286,355 @@ const ITEMS_ENTREGA_DEFAULT = [
   "LLAVES",
 ];
 
-// Secuencia de turnos para buscar el registro anterior de recepción
-const TURNO_ANTERIOR = { T1: "T3", T2: "T1", T3: "T2" };
+// Entrega general para toda Producción (no se separa por área).
+const AREA_ENTREGA = "produccion";
+const CLAVE_ENTREGA = "entrega-materiales-produccion";
 
-function fechaAtras(fecha, dias) {
-  const d = new Date(fecha + "T12:00:00");
-  d.setDate(d.getDate() - dias);
-  return d.toISOString().slice(0, 10);
+const ESTADOS_ENTREGA = [
+  { key: "Cumple",  emoji: "✅", cls: "bg-emerald-100 text-emerald-800 border-emerald-400" },
+  { key: "Falta",   emoji: "⚠️", cls: "bg-amber-100 text-amber-800 border-amber-400" },
+  { key: "Perdido", emoji: "❌", cls: "bg-red-100 text-red-800 border-red-400" },
+  { key: "Dañado",  emoji: "🔧", cls: "bg-violet-100 text-violet-800 border-violet-400" },
+];
+const estadoInfo = (k) => ESTADOS_ENTREGA.find((e) => e.key === k);
+
+// Stock fijo: lo guardado (Sheet) o, si todavía no hay nada, la lista base
+// con stock vacío.
+function stockEntrega(lista) {
+  const vistos = new Set();
+  const validos = (lista || []).filter((x) => {
+    const n = String(x?.nombre || "").trim().toUpperCase();
+    if (!n || vistos.has(n)) return false;
+    vistos.add(n); return true;
+  });
+  if (validos.length) return validos.map((x) => ({ id: String(x.nombre).trim().toUpperCase(), nombre: String(x.nombre).trim().toUpperCase(), stock: x.stock === "" || x.stock == null ? "" : num(x.stock) }));
+  return ITEMS_ENTREGA_DEFAULT.map((nombre) => ({ id: nombre, nombre, stock: "" }));
 }
 
-function buildResumenEntrega(record, areaLabel, inicialMap) {
-  const tE = record.turnoEntrega || "—";
-  const tR = record.turnoRecibe  || "—";
+// Cantidad efectivamente entregada de un artículo. Lo "Dañado" sí se entrega
+// (está, pero en mal estado); lo que Falta o se Perdió se descuenta.
+function entregadoDe(it) {
+  if (it.estado === "Cumple" || it.estado === "Dañado") return it.stock === "" ? "" : num(it.stock);
+  if (it.stock === "" || it.cant === "") return "";
+  return Math.max(num(it.stock) - num(it.cant), 0);
+}
+
+function conteoEstados(items) {
+  const c = {};
+  ESTADOS_ENTREGA.forEach((e) => { c[e.key] = 0; });
+  (items || []).forEach((it) => { if (c[it.estado] !== undefined) c[it.estado] += 1; });
+  return c;
+}
+
+function buildResumenEntrega(record) {
+  const sig = turnoSiguiente(record.fecha, record.turnoEntrega);
   const lines = [
-    `*Entrega de Materiales — ${areaLabel}*`,
-    `Fecha: ${fmtFecha(record.fecha)}`,
-    `${tE} → ${tR}`,
-    `Entrega: ${record.entrega || "—"} · Recibe: ${record.recibe || "—"}`,
+    `*Entrega de Materiales — Producción*`,
+    `Fecha: ${fmtFecha(record.fecha)} · ${record.turnoEntrega || "—"} → ${record.turnoRecibe || "—"}${sig && sig.fecha !== record.fecha ? ` (${fmtFecha(sig.fecha)})` : ""}`,
+    `Supervisor que entrega: ${record.entrega || "—"}`,
+    `Supervisor que recibe: ${record.recibe || "—"}`,
     "",
-    "*Artículos (Inicial → Entrega):*",
   ];
-  // Una línea por artículo con solo cantidad inicial y cantidad de entrega
-  // (sin bloque de código — algunos clientes de WhatsApp no muestran bien el
-  // texto dentro de ```, y hacía desaparecer tabla y observaciones).
-  let hayDiferencias = false;
+  const c = conteoEstados(record.items);
+  lines.push(`*Resumen:* ${ESTADOS_ENTREGA.filter((e) => c[e.key] > 0).map((e) => `${e.emoji} ${c[e.key]} ${e.key}`).join(" · ") || "—"}`);
+  lines.push("");
+  lines.push("*Detalle (entregado / stock fijo):*");
   (record.items || []).forEach((it) => {
-    if (it.cant === "" && !it.obs) return; // sin datos para este artículo — se omite
-    const ini = inicialMap ? (inicialMap[it.nombre] ?? "") : "";
-    const cambio = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
-    if (cambio) hayDiferencias = true;
-    const iniTxt = ini !== "" ? fmtNum(num(ini)) : "—";
-    const entTxt = it.cant !== "" ? fmtNum(num(it.cant)) : "—";
-    const flag = cambio ? " ⚠" : "";
-    const obsTxt = it.obs ? ` · Obs: ${it.obs}` : "";
-    lines.push(`• ${it.nombre}: ${iniTxt} → ${entTxt}${flag}${obsTxt}`);
+    const e = estadoInfo(it.estado);
+    const ent = entregadoDe(it);
+    const cantTxt = it.stock !== "" ? ` ${ent === "" ? "?" : fmtNum(ent)}/${fmtNum(num(it.stock))}` : "";
+    const extra = it.estado !== "Cumple"
+      ? `${it.cant !== "" && it.cant != null ? ` · ${it.estado}: ${fmtNum(num(it.cant))}` : ""}${it.obs ? ` · Obs: ${it.obs}` : ""}`
+      : "";
+    lines.push(`${e ? e.emoji : "•"} ${it.nombre}:${cantTxt}${extra}`);
   });
-  if (hayDiferencias) {
+  if (record.observacionGeneral) {
     lines.push("");
-    lines.push("⚠ Hubo cambios: no se entregaron todos los materiales en la misma cantidad del inicio del turno.");
+    lines.push(`*Observación general:* ${record.observacionGeneral}`);
   }
   return lines.join("\n");
 }
 
-function EntregaMaterialesCard({ areaKey, fecha, turno, autor, supervisoresList }) {
-  if (areaKey !== "seleccion" && areaKey !== "envasado") return null;
-
-  const areaLabel = areaKey === "seleccion" ? "Selección" : "Envasado";
-  const [records, saveRecords, loading] = useSharedList(`entrega-materiales-${areaKey}`);
-
-  // Turno que entrega = el turno que se está cerrando ahora mismo. Turno que
-  // recibe se calcula automáticamente (el que sigue cronológicamente).
-  const turnoEntrega = turno;
-  const turnoRecibeCalc = turnoSiguiente(fecha, turno);
-  const turnoRecibe = turnoRecibeCalc?.turno || "";
-
-  const [entrega, setEntrega] = useState(autor || "");
-  const [recibe,  setRecibe]  = useState("");
-  const [items,   setItems]   = useState(
-    ITEMS_ENTREGA_DEFAULT.map((nombre) => ({ nombre, cant: "", obs: "" }))
-  );
-  const [toast,     setToast]     = useState(null);
-  const [lastSaved, setLastSaved] = useState(null);
-
-  useEffect(() => { if (autor && !entrega) setEntrega(autor); }, [autor]);
-
-  // Busca el registro previo donde el turno anterior entregó AL turno actual
-  const inicialRecord = useMemo(() => {
-    if (!turnoEntrega) return null;
-    // Cadena: T3(día X) → T1(X) → T2(X) → T3(X+1). Quien entregó al turno que
-    // cierra ahora es el turno anterior en esa cadena, con su fecha exacta
-    // (para T3 es el T2 del día anterior).
-    const ant = turnoAnterior(fecha, turnoEntrega);
-    if (!ant) return null;
-    const candidatos = records.filter(
-      (r) => r.turnoEntrega === ant.turno &&
-             r.turnoRecibe  === turnoEntrega &&
-             r.fecha === ant.fecha
-    );
-    return [...candidatos].sort((a, b) => b.id - a.id)[0] || null;
-  }, [records, turnoEntrega, fecha]);
-
-  const inicialMap = useMemo(() => {
-    if (!inicialRecord) return {};
-    const m = {};
-    (inicialRecord.items || []).forEach((it) => { m[it.nombre] = it.cant; });
-    return m;
-  }, [inicialRecord]);
-
-  const setItemField = (idx, campo, valor) => {
-    if (campo === "cant") {
-      const v = valor.replace(/[^0-9]/g, "");
-      setItems((prev) => prev.map((it, i) => i === idx ? { ...it, cant: v } : it));
-    } else {
-      setItems((prev) => prev.map((it, i) => i === idx ? { ...it, [campo]: valor } : it));
-    }
-  };
-
-  const diferencias = items.filter((it) => {
-    const ini = inicialMap[it.nombre];
-    return ini !== undefined && ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
-  });
+// Editor del stock fijo (solo Jefe de producción) — mismo dato que la pestaña
+// "Stock Entrega Materiales (Base de Datos)" del Google Sheet.
+function StockFijoEditor({ stockLista, saveStock }) {
+  const [abierto, setAbierto] = useState(false);
+  const [filas, setFilas] = useState([]);
+  const [nuevo, setNuevo] = useState("");
+  const [toast, setToast] = useState(null);
+  useEffect(() => { setFilas(stockEntrega(stockLista)); }, [stockLista, abierto]);
 
   const guardar = async () => {
-    if (!fecha || !turnoEntrega) {
-      setToast({ kind: "error", message: "Falta fecha o turno del cierre." });
-      return;
-    }
-    const record = { id: Date.now(), fecha, turnoEntrega, turnoRecibe, entrega, recibe, items };
-    const ok = await saveRecords([
-      record,
-      ...records.filter((r) => !(r.fecha === fecha && r.turnoEntrega === turnoEntrega && r.turnoRecibe === turnoRecibe)),
-    ]);
-    if (ok) { setToast({ kind: "ok", message: "Entrega de materiales guardada." }); setLastSaved(record); }
-    else    { setToast({ kind: "error", message: "No se pudo guardar. Intenta nuevamente." }); }
+    const lista = filas
+      .map((f) => ({ nombre: String(f.nombre || "").trim().toUpperCase(), stock: f.stock === "" ? "" : num(f.stock) }))
+      .filter((f) => f.nombre)
+      .map((f) => ({ id: f.nombre, area: AREA_ENTREGA, ...f }));
+    const ok = await saveStock(lista);
+    setToast(ok ? { kind: "ok", message: "Stock fijo guardado. También queda en el Google Sheet." } : { kind: "error", message: "No se pudo guardar. Intenta nuevamente." });
+    setTimeout(() => setToast(null), 3500);
   };
 
   return (
-    <Card title="Entrega de Materiales">
-      <p className="text-xs text-slate-500 mb-3">
-        {turnoEntrega} ({fmtFecha(fecha)}) → {turnoRecibe || "—"} ({turnoRecibeCalc ? fmtFecha(turnoRecibeCalc.fecha) : "—"})
-      </p>
-
-      {inicialRecord ? (
-        <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-1.5 mb-3">
-          ✓ Cantidades iniciales cargadas desde entrega {inicialRecord.turnoEntrega} → {inicialRecord.turnoRecibe} del {fmtFecha(inicialRecord.fecha)}
-        </p>
+    <Card title="Stock fijo (Jefe de producción)">
+      {!abierto ? (
+        <button onClick={() => setAbierto(true)} className="w-full flex items-center justify-center gap-2 border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold rounded-xl py-2.5 text-sm">
+          <Settings size={16} /> Editar stock fijo
+        </button>
       ) : (
-        <p className="text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 mb-3">
-          Sin registro previo de recepción — la columna "Inicial" aparecerá vacía.
-        </p>
-      )}
-
-      <div className="grid grid-cols-2 gap-6 mb-4">
-        <div>
-          <label className="block text-xs font-medium text-slate-600 mb-1">Quien entrega ({turnoEntrega || "—"})</label>
-          <SupervisorSelect
-            area={areaKey === "seleccion" ? "Seleccion" : "Envasado"}
-            value={entrega}
-            onChange={setEntrega}
-            supervisoresList={supervisoresList}
-          />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-slate-600 mb-1">Quien recibe ({turnoRecibe || "—"})</label>
-          <SupervisorSelect
-            area={areaKey === "seleccion" ? "Seleccion" : "Envasado"}
-            value={recibe}
-            onChange={setRecibe}
-            supervisoresList={supervisoresList}
-          />
-        </div>
-      </div>
-
-      {diferencias.length > 0 && (
-        <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex items-start gap-3 mb-4">
-          <AlertTriangle size={18} className="text-amber-600 shrink-0 mt-0.5" />
-          <div>
-            <div className="text-sm font-semibold text-amber-800">
-              {diferencias.length} artículo{diferencias.length > 1 ? "s" : ""} con diferencia respecto al inicio del turno
+        <div className="space-y-2">
+          <p className="text-xs text-slate-500">Cantidad que debe haber siempre de cada artículo. Se ve y se puede editar también en la pestaña "Stock Entrega Materiales (Base de Datos)" del Google Sheet.</p>
+          {filas.map((f, i) => (
+            <div key={f.id || i} className="flex items-center gap-2">
+              <span className="flex-1 text-sm font-semibold text-slate-800">{f.nombre}</span>
+              <input type="number" min="0" inputMode="numeric" className={inputBase + " !w-24 text-center"} value={f.stock}
+                onChange={(e) => setFilas((p) => p.map((x, j) => j === i ? { ...x, stock: e.target.value } : x))} />
+              <button onClick={() => setFilas((p) => p.filter((_, j) => j !== i))} className="text-red-500 hover:text-red-700 p-1" aria-label={`Quitar ${f.nombre}`}><Trash2 size={15} /></button>
             </div>
-            <div className="text-xs text-amber-700 mt-0.5">
-              {diferencias.map((it) => `${it.nombre}: recibido ${inicialMap[it.nombre]} → entrega ${it.cant}`).join(" · ")}
-            </div>
+          ))}
+          <div className="flex items-center gap-2 pt-1">
+            <input className={inputBase} placeholder="Agregar artículo…" value={nuevo} onChange={(e) => setNuevo(e.target.value)} />
+            <button onClick={() => { const n = nuevo.trim().toUpperCase(); if (!n || filas.some((f) => f.nombre === n)) return; setFilas((p) => [...p, { id: n, nombre: n, stock: "" }]); setNuevo(""); }}
+              className="shrink-0 px-3 py-2 rounded-lg bg-slate-800 text-white text-sm font-semibold flex items-center gap-1"><Plus size={15} /> Agregar</button>
+          </div>
+          {toast && <Toast {...toast} />}
+          <div className="flex gap-2 pt-1">
+            <button onClick={guardar} className="flex-1 flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-xl py-2.5 text-sm"><Save size={16} /> Guardar stock fijo</button>
+            <button onClick={() => setAbierto(false)} className="px-4 rounded-xl border border-slate-300 text-slate-600 text-sm font-medium">Cerrar</button>
           </div>
         </div>
-      )}
-
-      <div className="overflow-x-auto -mx-1 mb-4">
-        <table className="w-full border-collapse text-sm min-w-[480px]">
-          <thead>
-            <tr className="bg-slate-100">
-              <th className="border border-slate-300 px-3 py-2 text-left   text-xs font-semibold text-slate-600 uppercase tracking-wide w-[38%]">Artículo</th>
-              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-500 uppercase tracking-wide w-[16%]">Cant. Inicial</th>
-              <th className="border border-slate-300 px-2 py-2 text-center text-xs font-semibold text-slate-600 uppercase tracking-wide w-[16%]">Cant. Entrega</th>
-              <th className="border border-slate-300 px-3 py-2 text-left   text-xs font-semibold text-slate-600 uppercase tracking-wide">Observación</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((it, idx) => {
-              const ini = inicialMap[it.nombre] ?? "";
-              const hayDiff = ini !== "" && it.cant !== "" && String(ini) !== String(it.cant);
-              return (
-                <tr key={it.nombre} className={hayDiff ? "bg-amber-50" : idx % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-                  <td className="border border-slate-200 px-3 py-2 font-semibold text-slate-800 align-middle">
-                    <div className="flex items-center gap-1.5">
-                      {hayDiff && <AlertTriangle size={13} className="text-amber-500 shrink-0" />}
-                      {it.nombre}
-                    </div>
-                  </td>
-                  <td className="border border-slate-200 px-2 py-2 text-center align-middle text-slate-500 font-medium bg-slate-50/50">
-                    {ini !== "" ? fmtNum(num(ini)) : <span className="text-slate-300">—</span>}
-                  </td>
-                  <td className={`border p-0 align-middle ${hayDiff ? "border-amber-300" : "border-slate-200"}`}>
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      className={`w-full h-full px-2 py-2 text-sm text-center bg-transparent focus:outline-none focus:bg-blue-50 focus:ring-1 focus:ring-blue-400 rounded ${hayDiff ? "text-amber-700 font-bold" : "text-slate-800"}`}
-                      placeholder="0"
-                      value={it.cant}
-                      onChange={(e) => setItemField(idx, "cant", e.target.value)}
-                    />
-                  </td>
-                  <td className="border border-slate-200 p-0 align-middle">
-                    <input
-                      type="text"
-                      className="w-full h-full px-3 py-2 text-sm bg-transparent focus:outline-none focus:bg-blue-50 focus:ring-1 focus:ring-blue-400 rounded"
-                      placeholder="—"
-                      value={it.obs}
-                      onChange={(e) => setItemField(idx, "obs", e.target.value)}
-                    />
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {toast && <div className="mb-3"><Toast {...toast} /></div>}
-
-      <button onClick={guardar}
-        className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-xl py-3 transition-colors">
-        <Save size={18} /> Guardar Entrega de Materiales
-      </button>
-
-      {lastSaved && (
-        <a href={whatsappShareUrl(buildResumenEntrega(lastSaved, areaLabel, inicialMap))} target="_blank" rel="noopener noreferrer"
-          className="w-full mt-2 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 transition-colors">
-          <Share2 size={18} /> Compartir por WhatsApp
-        </a>
       )}
     </Card>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Pestaña: Entrega de Materiales (Selección y Envasado) — separada del
-// Cierre de turno. La persona elige la fecha y el turno que entrega, igual
-// que en Cierre de turno, y aparece la misma tarjeta de siempre.
-// ---------------------------------------------------------------------------
-function EntregaMaterialesTab({ area, autor, supervisoresList }) {
+function EntregaMaterialesScreen({ onBack, autor, supervisoresList, isJefe }) {
   const [fecha, setFecha] = useState(today());
   const [turno, setTurno] = useState("");
+  const [entrega, setEntrega] = useState(autor || "");
+  const [recibe, setRecibe] = useState("");
+  const [items, setItems] = useState([]);
+  const [obsGeneral, setObsGeneral] = useState("");
+  const [toast, setToast] = useState(null);
+  const [lastSaved, setLastSaved] = useState(null);
+  const [intento, setIntento] = useState(false);
+
+  const [stockLista, saveStock, loadingStock] = useSharedList("stock-entrega");
+  const [records, saveRecords, loadingRecords] = useSharedList(CLAVE_ENTREGA);
+  const stock = useMemo(() => stockEntrega(stockLista), [stockLista]);
+
+  const sig = turno ? turnoSiguiente(fecha, turno) : null;
+  const turnoRecibe = sig?.turno || "";
+
+  // Si ya existe una entrega guardada para ese turno se carga para corregirla;
+  // si no, se parte con el stock fijo y los estados vacíos.
+  const existente = useMemo(
+    () => (turno ? [...records].filter((r) => r.fecha === fecha && r.turnoEntrega === turno && Array.isArray(r.items)).sort((a, b) => b.id - a.id)[0] : null) || null,
+    [records, fecha, turno]
+  );
+  useEffect(() => {
+    setLastSaved(null); setIntento(false);
+    if (existente) {
+      const porNombre = Object.fromEntries(existente.items.map((it) => [it.nombre, it]));
+      setItems(stock.map((s) => ({ nombre: s.nombre, stock: s.stock, estado: porNombre[s.nombre]?.estado || "", cant: porNombre[s.nombre]?.cant ?? "", obs: porNombre[s.nombre]?.obs || "" })));
+      setEntrega(existente.entrega || autor || "");
+      setRecibe(existente.recibe || "");
+      setObsGeneral(existente.observacionGeneral || "");
+    } else {
+      setItems(stock.map((s) => ({ nombre: s.nombre, stock: s.stock, estado: "", cant: "", obs: "" })));
+      setRecibe("");
+      setObsGeneral("");
+    }
+  }, [existente, stock, fecha, turno]);
+  useEffect(() => { if (autor && !entrega) setEntrega(autor); }, [autor]);
+
+  const setItem = (idx, campo, valor) => setItems((prev) => prev.map((it, i) => {
+    if (i !== idx) return it;
+    if (campo === "cant") return { ...it, cant: valor.replace(/[^0-9]/g, "") };
+    if (campo === "estado" && valor === "Cumple") return { ...it, estado: valor, cant: "" };
+    return { ...it, [campo]: valor };
+  }));
+  const todosCumple = () => setItems((prev) => prev.map((it) => (it.estado ? it : { ...it, estado: "Cumple" })));
+
+  const errores = [];
+  if (!turno) errores.push("Elige el turno que entrega.");
+  if (!entrega) errores.push("Falta el supervisor que entrega.");
+  if (!recibe) errores.push("Falta el supervisor que recibe.");
+  if (entrega && recibe && entrega === recibe) errores.push("El supervisor que entrega y el que recibe no pueden ser la misma persona.");
+  const sinEstado = items.filter((it) => !it.estado);
+  if (sinEstado.length) errores.push(`Falta marcar el estado de ${sinEstado.length} artículo${sinEstado.length > 1 ? "s" : ""}.`);
+  const sinCant = items.filter((it) => it.estado && it.estado !== "Cumple" && !(num(it.cant) > 0));
+  if (sinCant.length) errores.push(`Indica la cantidad de: ${sinCant.map((it) => it.nombre).join(", ")}.`);
+  const sinObs = items.filter((it) => it.estado && it.estado !== "Cumple" && !String(it.obs || "").trim());
+  if (sinObs.length) errores.push(`Escribe la observación de: ${sinObs.map((it) => it.nombre).join(", ")}.`);
+
+  const guardar = async () => {
+    setIntento(true);
+    if (errores.length) { setToast({ kind: "error", message: errores[0] }); return; }
+    const record = {
+      id: Date.now(), fecha, turnoEntrega: turno, turnoRecibe, entrega, recibe,
+      items: items.map((it) => ({ ...it, entregado: entregadoDe(it) })),
+      observacionGeneral: obsGeneral.trim(),
+    };
+    const ok = await saveRecords([record, ...records.filter((r) => !(r.fecha === fecha && r.turnoEntrega === turno))]);
+    if (ok) { setToast({ kind: "ok", message: "Entrega de materiales guardada." }); setLastSaved(record); }
+    else setToast({ kind: "error", message: "No se pudo guardar. Intenta nuevamente." });
+  };
+
+  const conteo = conteoEstados(items);
+  const recientes = [...records].filter((r) => Array.isArray(r.items)).sort((a, b) => (b.fecha + (ORDEN_TURNO_NUM[b.turnoEntrega] || 0)).localeCompare(a.fecha + (ORDEN_TURNO_NUM[a.turnoEntrega] || 0))).slice(0, 8);
+  const th = "border border-slate-300 px-1 sm:px-2 py-2 text-[10px] sm:text-xs font-semibold text-slate-600 uppercase tracking-wide leading-tight";
 
   return (
-    <div className="space-y-4 pb-10">
-      <Card title="Selecciona el turno que entrega" step={1}>
-        <div className="mb-3">
-          <label className="block text-xs font-medium text-slate-600 mb-1">Fecha</label>
-          <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fecha} onChange={(e) => setFecha(e.target.value)} />
-        </div>
-        <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
-        <TurnoSelector value={turno} onChange={(v) => { setTurno(v); setFecha((f) => ajustarFechaTurno(f, v)); }} />
-      </Card>
+    <div className="w-full max-w-2xl lg:max-w-4xl mx-auto pb-10">
+      <TopBar title="Entrega de materiales" subtitle="Producción · control del stock fijo entre turnos" onBack={onBack} icon={Truck} accent="purple" />
+      <div className="px-4 pt-4 space-y-4">
+        <Card title="Turno que entrega" step={1}>
+          <div className="mb-3">
+            <label className="block text-xs font-medium text-slate-600 mb-1">Fecha</label>
+            <input type="date" style={{ colorScheme: "light" }} className={inputBase} value={fecha} onChange={(e) => setFecha(e.target.value)} />
+          </div>
+          <label className="block text-xs font-medium text-slate-600 mb-1">Turno</label>
+          <TurnoSelector value={turno} onChange={(v) => { setTurno(v); setFecha((f) => ajustarFechaTurno(f, v)); }} />
+          {turno && (
+            <p className="text-xs text-slate-500 mt-2">
+              Entrega {turno} ({fmtFecha(fecha)}) → recibe {turnoRecibe} ({sig ? fmtFecha(sig.fecha) : "—"})
+              {existente && <span className="ml-1 text-violet-700 font-medium">· Ya hay una entrega guardada para este turno: puedes corregirla.</span>}
+            </p>
+          )}
+        </Card>
 
-      {!turno ? (
-        <Card><EmptyNote text="Selecciona la fecha y el turno que entrega para registrar la entrega de materiales." /></Card>
-      ) : (
-        <EntregaMaterialesCard areaKey={area.key} fecha={fecha} turno={turno} autor={autor} supervisoresList={supervisoresList} />
-      )}
+        {turno && (
+          <Card title="Entrega de Materiales" step={2}>
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Supervisor que entrega ({turno})</label>
+                <SupervisorSelect area={null} value={entrega} onChange={setEntrega} supervisoresList={supervisoresList} />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Supervisor que recibe ({turnoRecibe || "—"})</label>
+                <SupervisorSelect area={null} value={recibe} onChange={setRecibe} supervisoresList={supervisoresList} />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex flex-wrap gap-1.5 text-xs">
+                {ESTADOS_ENTREGA.map((e) => (
+                  <span key={e.key} className={`px-2 py-0.5 rounded-full border ${e.cls}`}>{e.key}: <b>{conteo[e.key]}</b></span>
+                ))}
+              </div>
+              <button onClick={todosCumple} className="text-xs font-semibold text-emerald-700 border border-emerald-300 rounded-lg px-2.5 py-1 hover:bg-emerald-50">Marcar el resto como Cumple</button>
+            </div>
+
+            {(loadingStock || loadingRecords) && items.length === 0 ? (
+              <p className="text-sm text-slate-500 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Cargando…</p>
+            ) : (
+              <div className="-mx-1 mb-4">
+                <table className="w-full table-fixed border-collapse text-xs sm:text-sm">
+                  <thead>
+                    <tr className="bg-slate-100">
+                      <th className={`${th} text-left w-[27%]`}>Artículo</th>
+                      <th className={`${th} text-center w-[14%]`}>Entreg. / Stock</th>
+                      <th className={`${th} text-center w-[24%]`}>Estado</th>
+                      <th className={`${th} text-center w-[11%]`}>Cant.</th>
+                      <th className={`${th} text-left`}>Observación</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((it, idx) => {
+                      const e = estadoInfo(it.estado);
+                      const noCumple = it.estado && it.estado !== "Cumple";
+                      const faltaEstado = intento && !it.estado;
+                      const faltaCant = intento && noCumple && !(num(it.cant) > 0);
+                      const faltaObs = intento && noCumple && !String(it.obs || "").trim();
+                      const ent = entregadoDe(it);
+                      const rowBg = noCumple ? "bg-amber-50" : idx % 2 === 0 ? "bg-white" : "bg-slate-50";
+                      return (
+                        <tr key={it.nombre} className={rowBg}>
+                          <td className="border border-slate-200 px-1.5 sm:px-3 py-2 font-semibold text-slate-800 align-middle break-words leading-tight">
+                            {it.nombre}
+                          </td>
+                          <td className="border border-slate-200 px-1 py-2 text-center align-middle text-slate-600 font-medium whitespace-nowrap">
+                            {it.stock === "" ? <span className="text-slate-300">—</span> : (
+                              <>
+                                <span className={`font-bold ${it.estado ? (noCumple && it.estado !== "Dañado" ? "text-amber-700" : "text-slate-900") : "text-slate-300"}`}>{it.estado && ent !== "" ? fmtNum(ent) : "–"}</span>
+                                <span className="text-slate-400">/{fmtNum(num(it.stock))}</span>
+                              </>
+                            )}
+                          </td>
+                          <td className={`border p-1 align-middle ${faltaEstado ? "border-red-400 bg-red-50" : "border-slate-200"}`}>
+                            <select value={it.estado} onChange={(ev) => setItem(idx, "estado", ev.target.value)}
+                              className={`w-full rounded-md border px-0.5 sm:px-1.5 py-1.5 text-xs sm:text-sm font-semibold focus:outline-none focus:ring-1 focus:ring-blue-400 ${e ? e.cls : "bg-white text-slate-500 border-slate-300"}`}>
+                              <option value="">Elegir</option>
+                              {ESTADOS_ENTREGA.map((x) => <option key={x.key} value={x.key}>{x.key}</option>)}
+                            </select>
+                          </td>
+                          <td className={`border p-0 align-middle ${faltaCant ? "border-red-400 bg-red-50" : "border-slate-200"}`}>
+                            <input type="text" inputMode="numeric" pattern="[0-9]*" disabled={!noCumple}
+                              className="w-full h-full px-1 py-2 text-xs sm:text-sm text-center bg-transparent focus:outline-none focus:bg-blue-50 focus:ring-1 focus:ring-blue-400 rounded disabled:text-slate-300"
+                              placeholder={noCumple ? "0" : "—"} value={it.cant} onChange={(ev) => setItem(idx, "cant", ev.target.value)} />
+                          </td>
+                          <td className={`border p-0 align-middle ${faltaObs ? "border-red-400 bg-red-50" : "border-slate-200"}`}>
+                            <input type="text"
+                              className="w-full h-full px-1.5 sm:px-3 py-2 text-xs sm:text-sm bg-transparent focus:outline-none focus:bg-blue-50 focus:ring-1 focus:ring-blue-400 rounded"
+                              placeholder={noCumple ? "Obligatoria" : "—"} value={it.obs} onChange={(ev) => setItem(idx, "obs", ev.target.value)} />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="mb-4">
+              <label className="block text-xs font-medium text-slate-600 mb-1">Observación general (opcional)</label>
+              <textarea rows={2} className={inputBase} value={obsGeneral} onChange={(e) => setObsGeneral(e.target.value)} />
+            </div>
+
+            {intento && errores.length > 0 && (
+              <div className="bg-red-50 border border-red-300 rounded-xl px-4 py-3 text-sm text-red-800 space-y-0.5 mb-3">
+                {errores.map((e) => <div key={e}>• {e}</div>)}
+              </div>
+            )}
+            {toast && <div className="mb-3"><Toast {...toast} /></div>}
+            <button onClick={guardar} className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-xl py-3 transition-colors">
+              <Save size={18} /> Guardar Entrega de Materiales
+            </button>
+            {lastSaved && (
+              <a href={whatsappShareUrl(buildResumenEntrega(lastSaved))} target="_blank" rel="noopener noreferrer"
+                className="w-full mt-2 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl py-3 transition-colors">
+                <Share2 size={18} /> Compartir por WhatsApp
+              </a>
+            )}
+          </Card>
+        )}
+
+        {recientes.length > 0 && (
+          <Card title="Últimas entregas">
+            <div className="space-y-1.5">
+              {recientes.map((r) => {
+                const c = conteoEstados(r.items);
+                return (
+                  <div key={r.id} className="flex items-center justify-between gap-2 border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-slate-800">{fmtFecha(r.fecha)} · {r.turnoEntrega} → {r.turnoRecibe}</div>
+                      <div className="text-slate-500 truncate">{r.entrega || "—"} → {r.recibe || "—"} · {ESTADOS_ENTREGA.filter((e) => c[e.key] > 0).map((e) => `${e.key} ${c[e.key]}`).join(" · ")}</div>
+                    </div>
+                    <a href={whatsappShareUrl(buildResumenEntrega(r))} target="_blank" rel="noopener noreferrer" className="shrink-0 text-emerald-700 hover:text-emerald-900 p-1" aria-label="Compartir por WhatsApp"><Share2 size={16} /></a>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
+
+        {isJefe && <StockFijoEditor stockLista={stockLista} saveStock={saveStock} />}
+      </div>
     </div>
   );
 }
+
+const ORDEN_TURNO_NUM = { T3: 1, T1: 2, T2: 3 };
 
 function VerificadorHoraScreen({ onBack }) {
   const [horaConsulta, setHoraConsulta] = useState(horaActualStr());
@@ -6656,15 +6750,14 @@ function resumenLavadoCierreCompleto(r, inicio) {
     if (v > 0) produccion.push([t.label, `${fmtNum(v)} pallets`, "plano"]);
   });
   produccion.push(["Total pallets pendientes", fmtNum(totalPalletsManual(r, "pendientes"))]);
-  const materiales = [
-    ["Rollos de film", fmtNum(r.rollosFilm || 0)],
-    ["Bolsas de bins", fmtNum(r.bolsasBins || 0)],
+  // Lo CONSUMIDO en el turno va aparte de lo que QUEDA en piso de planta para
+  // el siguiente turno.
+  const consumidos = [
+    ["Rollos de film", `${fmtNum(r.rollosFilm || 0)} rollos`],
+    ["Bolsas de bins", `${fmtNum(r.bolsasBins || 0)} paquetes`],
   ];
-  MATERIALES_LAVADO.forEach((nombre, i) => {
-    const v = num(r[`finMat_${i}`]);
-    if (v > 0) materiales.push([`Material · ${nombre}`, fmtNum(v)]);
-  });
-  return { dotacion, produccion, materiales };
+  const materiales = MATERIALES_LAVADO.map((nombre, i) => [nombre, fmtNum(num(r[`finMat_${i}`]))]);
+  return { dotacion, produccion, consumidos, materiales, tituloMateriales: "Materiales de Piso (stock para el próximo turno)" };
 }
 
 // Total por puesto (Operarios, Movilizadores, Jefe de Línea) sumando TODAS
@@ -7527,11 +7620,6 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
   const tabs = [
     { key: "inicio", label: "Inicio de turno", icon: ClipboardList },
     { key: "cierre", label: "Cierre de turno", icon: ClipboardCheck },
-    // Entrega de Materiales solo aplica a Selección y Envasado (Lavado no maneja
-    // esta entrega entre turnos) — pestaña propia, separada del Cierre de turno.
-    ...(area.key === "seleccion" || area.key === "envasado"
-      ? [{ key: "entrega", label: "Entrega Materiales", icon: Truck }]
-      : []),
     { key: "indicadores", label: "Indicadores", icon: BarChart3 },
     { key: "registros", label: "Registros", icon: Pencil },
   ];
@@ -7561,7 +7649,6 @@ function AreaScreen({ areaKey, isJefe, autor, onBack, supervisoresList }) {
           <InicioTab area={area} values={values} setField={setField} editingId={editingId} onSaved={handleSaved} onCancelEdit={cancelEdit} autor={autor} />
         )}
         {tab === "cierre" && <CierreTab area={area} autor={autor} initialTarget={cierreTarget} supervisoresList={supervisoresList} />}
-        {tab === "entrega" && <EntregaMaterialesTab area={area} autor={autor} supervisoresList={supervisoresList} />}
         {tab === "indicadores" && <IndicadoresTab area={area} />}
         {tab === "registros" && <RegistrosTab area={area} onEdit={startEdit} onEditCierre={startEditCierre} />}
       </div>
@@ -9408,6 +9495,18 @@ function HomeScreen({ onNavigate, isJefe, onOpenLogin, onLogoutJefe, autor }) {
           <ChevronRight size={24} className="text-white/70 shrink-0" />
         </button>
 
+        <button onClick={() => onNavigate("entrega-materiales")}
+          className="w-full bg-gradient-to-br from-violet-600 to-purple-700 hover:from-violet-500 hover:to-purple-600 text-white rounded-2xl p-6 text-left shadow-lg transition-all flex items-center gap-5">
+          <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
+            <Truck size={30} className="text-white" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="font-extrabold text-xl leading-tight">Entrega de materiales</div>
+            <div className="text-violet-100 text-sm mt-1">Producción · stock fijo entre turnos</div>
+          </div>
+          <ChevronRight size={24} className="text-white/70 shrink-0" />
+        </button>
+
         <button onClick={() => onNavigate("reporte-semanal")}
           className="w-full bg-gradient-to-br from-teal-600 to-emerald-700 hover:from-teal-500 hover:to-emerald-600 text-white rounded-2xl p-6 text-left shadow-lg transition-all flex items-center gap-5">
           <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
@@ -9585,6 +9684,9 @@ export default function App() {
       {/* Herramientas del Jefe — back siempre al home */}
       {screen === "dashboard" && isJefe && <JefeDashboard onBack={() => setScreen("home")} />}
       {screen === "reporte-semanal" && <ReporteSemanalScreen onBack={() => setScreen("home")} />}
+      {screen === "entrega-materiales" && (
+        <EntregaMaterialesScreen onBack={() => setScreen("home")} autor={portalProps.autor} supervisoresList={supervisoresList || []} isJefe={isJefe} />
+      )}
       {screen === "programa" && isJefe && <ProgramaProduccionScreen onBack={() => setScreen("home")} />}
       {screen === "especies" && isJefe && <EspeciesPorLineaScreen onBack={() => setScreen("home")} />}
       {screen === "insumos-config"  && isJefe && <InsumosConfigScreen onBack={() => setScreen("home")} />}
