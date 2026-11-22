@@ -4570,7 +4570,44 @@ function especiesActivasLinea(l, inicio, values) {
 
 // Hasta 3 filas de "Tipo de aprobado" (nombre desde lista + Kg) por especie.
 // Componente de módulo (no anidar) para que React no pierda su identidad.
-function KgAprobadoRows({ lineaKey, slot, values, setField, tipos: especiesDisponibles }) {
+// Kg obtenidos de subproductos por proceso (no cuentan en el rendimiento).
+const KG_OBTENIDOS = [
+  { key: "rep",   label: "Kg x Rep" },
+  { key: "pro",   label: "Kg x Pro" },
+  { key: "prosl", label: "Kg x Pro S/L" },
+  { key: "pure",  label: "Kg Puré" },
+  { key: "jugo",  label: "Kg Jugo" },
+];
+const kgObtenidosTotal = (values, lineaKey, slot) =>
+  KG_OBTENIDOS.reduce((a, o) => a + num(values[`kg_${lineaKey}_e${slot}_${o.key}`]), 0);
+
+function KgObtenidosFields({ lineaKey, slot, values, setField }) {
+  return (
+    <div className="space-y-2 pt-1 border-t border-slate-200">
+      <label className="block text-xs font-medium text-slate-600">Kg obtenidos</label>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+        {KG_OBTENIDOS.map((o) => (
+          <NumField key={o.key} label={o.label} value={values[`kg_${lineaKey}_e${slot}_${o.key}`]}
+            onChange={(v) => setField(`kg_${lineaKey}_e${slot}_${o.key}`, v)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function KgAprobadoRows({ lineaKey, slot, values, setField, tipos: especiesDisponibles, especieDefault }) {
+  // La Especie 1 parte con la especie del proceso del programa, si aún no se
+  // eligió ninguna.
+  const campoT1 = `kg_${lineaKey}_e${slot}_apr_t1_tipo`;
+  const defValido = especieDefault && especieDefault !== "—" ? especieDefault : "";
+  useEffect(() => {
+    if (defValido && !values[campoT1]) setField(campoT1, defValido);
+    // depende de `values` completo: el Cierre reinicia el formulario al cargar
+    // el turno, y ahí hay que volver a poner la especie por defecto.
+  }, [defValido, campoT1, values]);
+  const opcionesEspecie = defValido && !(especiesDisponibles || []).includes(defValido)
+    ? [defValido, ...(especiesDisponibles || [])]
+    : especiesDisponibles;
   const filasActivas = APROBADO_SLOTS.filter((t) => {
     const tipo = values[`kg_${lineaKey}_e${slot}_apr_t${t}_tipo`];
     const kg = values[`kg_${lineaKey}_e${slot}_apr_t${t}_kg`];
@@ -4599,12 +4636,12 @@ function KgAprobadoRows({ lineaKey, slot, values, setField, tipos: especiesDispo
               label={`Especie ${t}`}
               value={values[`kg_${lineaKey}_e${slot}_apr_t${t}_tipo`] || ""}
               onChange={(v) => setField(`kg_${lineaKey}_e${slot}_apr_t${t}_tipo`, v)}
-              options={especiesDisponibles}
+              options={opcionesEspecie}
             />
           </div>
           <div className="flex-1">
             <NumField
-              label="Kg"
+              label="Kg Aprobados"
               value={values[`kg_${lineaKey}_e${slot}_apr_t${t}_kg`]}
               onChange={(v) => setField(`kg_${lineaKey}_e${slot}_apr_t${t}_kg`, v)}
             />
@@ -4730,7 +4767,9 @@ function SeleccionCierre({ values, setField, inicio, programaEntries }) {
                           )}
                         </div>
                         <NumField label="Kg ingresados" value={values[`kg_${l.key}_e${s}_ing`]} onChange={(v) => setField(`kg_${l.key}_e${s}_ing`, v)} />
-                        <KgAprobadoRows lineaKey={l.key} slot={s} values={values} setField={setField} tipos={especiesLinea} />
+                        <KgAprobadoRows lineaKey={l.key} slot={s} values={values} setField={setField} tipos={especiesLinea}
+                          especieDefault={proceso && proceso !== "—" ? especieDeProceso(l.key, proceso) : ""} />
+                        <KgObtenidosFields lineaKey={l.key} slot={s} values={values} setField={setField} />
                         <p className="text-sm text-slate-700 pt-1 border-t border-slate-200">
                           Kg aprobados total: <span className="font-semibold">{fmtNum(apr, 1)}</span> · Rendimiento: <span className="font-semibold">{fmtPct(rend)}</span>
                         </p>
@@ -5352,7 +5391,7 @@ function EnvasadoCierre({ values, setField, inicio, programaEntries }) {
               <span className="text-slate-700 font-medium">{especieLinea5 || "—"}</span>
             </div>
             <NumField label="Kg ingresados" value={values.kg_linea5_e1_ing} onChange={(v) => setField("kg_linea5_e1_ing", v)} />
-            <KgAprobadoRows lineaKey="linea5" slot={1} values={values} setField={setField} tipos={especieLinea5 ? [especieLinea5] : []} />
+            <KgAprobadoRows lineaKey="linea5" slot={1} values={values} setField={setField} tipos={especieLinea5 ? [especieLinea5] : []} especieDefault={especieLinea5 || ""} />
             <p className="text-sm text-slate-700 pt-1 border-t border-slate-200">
               Kg aprobados total: <span className="font-semibold">{fmtNum(m.l5Apr, 1)}</span> · Rendimiento: <span className="font-semibold">{fmtPct(m.rendimientoLinea5)}</span>
             </p>
@@ -6855,6 +6894,10 @@ function resumenSeleccionCierreCompleto(r, inicio, programaEntries) {
         produccion.push(["Kg ingresados", fmtNum(ing)]);
         produccion.push(["Kg aprobados", fmtNum(apr)]);
         produccion.push(["Rendimiento", fmtPct(ing ? apr / ing : 0)]);
+        KG_OBTENIDOS.forEach((o) => {
+          const v = num(r[`kg_${l.key}_e${s}_${o.key}`]);
+          if (v > 0) produccion.push([o.label, fmtNum(v)]);
+        });
       });
     });
   }
