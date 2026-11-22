@@ -8607,13 +8607,33 @@ function PanelIndicadores({ r, p, svg, ovr, filtro }) {
 // Selección), más datos de ingreso manual diario (cargas de túnel, fruta
 // fresca, fruta producción, fruta en logística) y envasado Plan/Real.
 // ---------------------------------------------------------------------------
-const ESP_FIJAS_PLANILLA = ["Frambuesa", "Uva", "Arandano", "Frutilla"];
+const ESPECIES_PLANILLA = ["Arandano", "Frutilla", "Frambuesa", "Mora", "Uva"];
+// Especies que siempre aparecen (con su Sub Total) en la sección Selección.
+const ESP_FIJAS_PLANILLA = ESPECIES_PLANILLA;
 const MANUAL_SECCIONES = [
-  { key: "fresca",     titulo: "Fruta Fresca",        especies: ["Frambuesa", "Mora", "Arandano", "Frutilla", "Uva"], hora: true },
-  { key: "produccion", titulo: "Fruta Producción",    especies: ["Frambuesa", "Mora", "Arandano"] },
-  { key: "logistica",  titulo: "Fruta en Logística",  especies: ["Frambuesa", "Mora", "Arandano", "Uva"] },
+  { key: "fresca",     titulo: "Fruta Fresca",        especies: ESPECIES_PLANILLA, hora: true },
+  { key: "produccion", titulo: "Fruta Producción",    especies: ESPECIES_PLANILLA },
+  { key: "logistica",  titulo: "Fruta en Logística",  especies: ESPECIES_PLANILLA },
 ];
 const DIAS_PLANILLA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+// Reconoce la especie en un texto (nombre de especie o de proceso), en
+// español o inglés: RASPBERRIES → Frambuesa, BLUEBERRIES → Arandano, etc.
+// Así los procesos que empiezan con el cliente (GVO, PUBLIX, GV…) se agrupan
+// por su fruta. MIX queda como "Mix".
+const REGLAS_ESPECIE_PLANILLA = [
+  [/\bMIX/i, "Mix"],
+  [/FRAMBUES|RASPBERR/i, "Frambuesa"],
+  [/AR[AÁ]ND|BLUEBERR/i, "Arandano"],
+  [/FRUTILL|STRAWBERR|\bFRUT\b/i, "Frutilla"],
+  [/\bMORA|BLACKBERR/i, "Mora"],
+  [/\bUVA|GRAPE/i, "Uva"],
+  [/CEREZ|CHERR/i, "Cereza"],
+];
+const especieDeTexto = (t) => {
+  const r = REGLAS_ESPECIE_PLANILLA.find(([re]) => re.test(String(t || "")));
+  return r ? r[1] : null;
+};
+const especiePlanilla = (especie, proceso) => especieDeTexto(especie) || especieDeTexto(proceso) || espBasePlanilla(especie);
 const espBasePlanilla = (e) => {
   const w = String(e || "").trim().split(/\s+/)[0] || "—";
   const nombre = w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
@@ -8637,32 +8657,42 @@ function armarPlanilla(datos, manual, desde) {
   const enRango = (r) => r.fecha && r.fecha >= desde && r.fecha <= hasta;
   const fus = (a) => a.cierres.filter(enRango).map((c) => ({ ...(masRecientePorClave(a.inicio, c.claveTurno) || {}), ...c }));
 
-  // ---- Selección: una fila por especie + turno + línea ----
+  // ---- Selección: tipo de proceso (Selección / Spot / Apertura) → especie →
+  // una fila por turno + línea ----
   const filas = {};
   fus(datos.seleccion).forEach((c) => {
     kgPorProcesoEspecie(c).forEach((x) => {
-      const esp = espBasePlanilla(x.especie);
-      const k = `${esp}||${c.turno}||${x.linea}`;
-      const f = (filas[k] = filas[k] || { esp, turno: c.turno, linea: x.linea.replace("Línea ", "L"), dias: {} });
+      const tipo = TIPOS_PROCESO.includes(x.tipo) ? x.tipo : "Selección";
+      const esp = especiePlanilla(x.especie, x.proceso);
+      const k = `${tipo}||${esp}||${c.turno}||${x.linea}`;
+      const f = (filas[k] = filas[k] || { tipo, esp, turno: c.turno, linea: x.linea.replace("Línea ", "L"), dias: {} });
       const d = (f.dias[c.fecha] = f.dias[c.fecha] || { ing: 0, apr: 0 });
       d.ing += x.ing; d.apr += x.apr;
     });
   });
   const ordenTurno = { T1: 0, T2: 1, T3: 2 };
-  const especies = [...new Set([...ESP_FIJAS_PLANILLA, ...Object.values(filas).map((f) => f.esp)])];
-  const grupos = especies.map((esp) => {
-    const rows = Object.values(filas).filter((f) => f.esp === esp)
-      .sort((a, b) => (ordenTurno[a.turno] ?? 9) - (ordenTurno[b.turno] ?? 9) || a.linea.localeCompare(b.linea));
-    const sub = {};
-    fechas.forEach((f) => {
-      sub[f] = rows.reduce((s, r) => ({ ing: s.ing + (r.dias[f]?.ing || 0), apr: s.apr + (r.dias[f]?.apr || 0) }), { ing: 0, apr: 0 });
+  const sumaDias = (lista, get) => {
+    const o = {};
+    fechas.forEach((f) => { o[f] = lista.reduce((s, x) => { const v = get(x, f); return { ing: s.ing + v.ing, apr: s.apr + v.apr }; }, { ing: 0, apr: 0 }); });
+    return o;
+  };
+  const tipos = TIPOS_PROCESO.map((tipo) => {
+    const delTipo = Object.values(filas).filter((f) => f.tipo === tipo);
+    // En "Selección" siempre se muestran las 5 especies; en Spot y Apertura,
+    // solo las que tuvieron proceso en la semana.
+    const conDatos = [...new Set(delTipo.map((f) => f.esp))];
+    const orden = (e) => { const i = [...ESPECIES_PLANILLA, "Mix"].indexOf(e); return i < 0 ? 99 : i; };
+    const especies = [...new Set([...(tipo === "Selección" ? ESP_FIJAS_PLANILLA : []), ...conDatos])]
+      .sort((a, b) => orden(a) - orden(b) || a.localeCompare(b));
+    const grupos = especies.map((esp) => {
+      const rows = delTipo.filter((f) => f.esp === esp)
+        .sort((a, b) => (ordenTurno[a.turno] ?? 9) - (ordenTurno[b.turno] ?? 9) || a.linea.localeCompare(b.linea));
+      return { esp, rows, sub: sumaDias(rows, (r, f) => r.dias[f] || { ing: 0, apr: 0 }) };
     });
-    return { esp, rows, sub };
+    return { tipo, grupos, sub: sumaDias(grupos, (g, f) => g.sub[f]) };
   });
-  const total = {};
-  fechas.forEach((f) => {
-    total[f] = grupos.reduce((s, g) => ({ ing: s.ing + g.sub[f].ing, apr: s.apr + g.sub[f].apr }), { ing: 0, apr: 0 });
-  });
+  const grupos = tipos.flatMap((t) => t.grupos);
+  const total = sumaDias(tipos, (t, f) => t.sub[f]);
 
   // ---- Datos manuales ----
   const man = {};
@@ -8699,7 +8729,7 @@ function armarPlanilla(datos, manual, desde) {
     });
     return { turno: t, dias };
   });
-  return { fechas, grupos, total, man, secciones, envasado, lavado };
+  return { fechas, tipos, grupos, total, man, secciones, envasado, lavado };
 }
 
 function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
@@ -8747,7 +8777,12 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
           <tr>{P.fechas.map((f) => ["Kg Ing", "IQF", "Rend"].map((t) => <th key={f + t} className={th}>{t}</th>))}</tr>
         </thead>
         <tbody>
-          {P.grupos.map((g) => (
+          {P.tipos.filter((t) => t.grupos.some((g) => g.rows.length > 0)).map((t) => (
+            <React.Fragment key={t.tipo}>
+              <tr className="font-bold">
+                <td colSpan={1 + nDias * 3} className="border border-slate-300 px-1.5 py-[3px] text-left text-white uppercase tracking-wide" style={{ background: TIPOS_PROCESO_COLORES[t.tipo] }}>{t.tipo}</td>
+              </tr>
+          {t.grupos.map((g) => (
             <React.Fragment key={g.esp}>
               {g.rows.map((r) => (
                 <tr key={`${r.turno}${r.linea}`}>
@@ -8772,8 +8807,20 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
               </tr>
             </React.Fragment>
           ))}
+              {t.grupos.length > 0 && (
+                <tr className="font-bold bg-sky-200">
+                  <td className={`${lab} bg-sky-200`}>Total {t.tipo}</td>
+                  {P.fechas.map((f) => [
+                    <td key={f + "a"} className={td}>{f0(t.sub[f].ing)}</td>,
+                    <td key={f + "b"} className={td}>{f0(t.sub[f].apr)}</td>,
+                    <td key={f + "c"} className={td}>{pct(t.sub[f].apr, t.sub[f].ing)}</td>,
+                  ])}
+                </tr>
+              )}
+            </React.Fragment>
+          ))}
           <tr className="font-bold bg-sky-100">
-            <td className={`${lab} bg-sky-100`}>Total</td>
+            <td className={`${lab} bg-sky-100`}>Total general</td>
             {P.fechas.map((f) => [
               <td key={f + "a"} className={td}>{f0(P.total[f].ing)}</td>,
               <td key={f + "b"} className={td}>{f0(P.total[f].apr)}</td>,
@@ -8836,7 +8883,7 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
           </tr>
 
           <tr className="font-bold bg-sky-200">
-            <td className={`${lab} bg-sky-200`}>Lavado (pallets)</td>
+            <td className={`${lab} bg-sky-200`}>Lavado de Bandejas</td>
             {P.fechas.map((f) => ["Lavados", "Rotos", "%Rot."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
           </tr>
           {P.lavado.map((e) => (
