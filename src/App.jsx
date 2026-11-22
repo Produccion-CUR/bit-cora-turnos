@@ -8611,10 +8611,16 @@ const ESPECIES_PLANILLA = ["Arandano", "Frutilla", "Frambuesa", "Mora", "Uva"];
 // Especies que siempre aparecen (con su Sub Total) en la sección Selección.
 const ESP_FIJAS_PLANILLA = ESPECIES_PLANILLA;
 const MANUAL_SECCIONES = [
-  { key: "fresca",     titulo: "Fruta Fresca",        especies: ESPECIES_PLANILLA, hora: true },
-  { key: "produccion", titulo: "Fruta Producción",    especies: ESPECIES_PLANILLA },
-  { key: "logistica",  titulo: "Fruta en Logística",  especies: ESPECIES_PLANILLA },
+  { key: "fresca",     titulo: "Fruta Fresca",        especies: ESPECIES_PLANILLA, hora: true, color: "#15803d" },
+  { key: "produccion", titulo: "Fruta Producción",    especies: ESPECIES_PLANILLA, color: "#be123c" },
+  { key: "logistica",  titulo: "Fruta en Logística",  especies: ESPECIES_PLANILLA, color: "#4338ca" },
 ];
+// Color de banda de las demás secciones de la planilla.
+const COLORES_PLANILLA = { cargas: "#334155", envasado: "#1d4ed8", lavado: "#0e7490" };
+// Banda: fondo del color de la sección y texto blanco. Tinte: el mismo color
+// muy suave para la fila "Total" de esa sección.
+const bandaPlanilla = (c) => ({ background: c, color: "#fff" });
+const tintePlanilla = (c) => ({ background: `${c}1f` });
 const DIAS_PLANILLA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 // Reconoce la especie en un texto (nombre de especie o de proceso), en
 // español o inglés: RASPBERRIES → Frambuesa, BLUEBERRIES → Arandano, etc.
@@ -8828,16 +8834,16 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
             ])}
           </tr>
 
-          <tr className="font-bold bg-sky-300">
-            <td className={`${lab} bg-sky-300`}>Cargas de túnel</td>
-            {P.fechas.map((f) => <td key={f} colSpan={3} className={`${td} bg-sky-300`}>{f0(num(P.man[f]?.cargasTunel))}</td>)}
+          <tr className="font-bold">
+            <td className={lab} style={bandaPlanilla(COLORES_PLANILLA.cargas)}>Cargas de túnel</td>
+            {P.fechas.map((f) => <td key={f} colSpan={3} className={td} style={bandaPlanilla(COLORES_PLANILLA.cargas)}>{f0(num(P.man[f]?.cargasTunel))}</td>)}
           </tr>
 
           {P.secciones.map((s) => (
             <React.Fragment key={s.key}>
-              <tr className="font-bold bg-slate-200">
-                <td className={`${lab} bg-slate-200`}>{s.titulo}</td>
-                {P.fechas.map((f) => <td key={f} colSpan={3} className={`${td} bg-slate-200 text-center font-normal`}>{s.hora ? (P.man[f]?.frescaHora || "") : ""}</td>)}
+              <tr className="font-bold">
+                <td className={lab} style={bandaPlanilla(s.color)}>{s.titulo}</td>
+                {P.fechas.map((f) => <td key={f} colSpan={3} className={`${td} text-center font-normal`} style={bandaPlanilla(s.color)}>{s.hora ? (P.man[f]?.frescaHora || "") : ""}</td>)}
               </tr>
               {s.esps.map((e) => (
                 <tr key={e}>
@@ -8845,16 +8851,16 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
                   {P.fechas.map((f) => <td key={f} colSpan={3} className={td}>{f0(s.valor(f, e))}</td>)}
                 </tr>
               ))}
-              <tr className="font-bold bg-sky-100">
-                <td className={`${lab} bg-sky-100`}>Total</td>
+              <tr className="font-bold" style={tintePlanilla(s.color)}>
+                <td className={lab} style={{ background: "transparent" }}>Total {s.titulo}</td>
                 {P.fechas.map((f) => <td key={f} colSpan={3} className={td}>{f0(s.total(f))}</td>)}
               </tr>
             </React.Fragment>
           ))}
 
-          <tr className="font-bold bg-sky-200">
-            <td className={`${lab} bg-sky-200`}>Envasado (cajas)</td>
-            {P.fechas.map((f) => ["Plan", "Real", "%Cum."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
+          <tr className="font-bold">
+            <td className={lab} style={bandaPlanilla(COLORES_PLANILLA.envasado)}>Envasado (cajas)</td>
+            {P.fechas.map((f) => ["Plan", "Real", "%Cum."].map((t) => <td key={f + t} className={`${td} text-center`} style={bandaPlanilla(COLORES_PLANILLA.envasado)}>{t}</td>))}
           </tr>
           {P.envasado.map((e) => (
             <tr key={e.turno}>
@@ -8869,8 +8875,8 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
               })}
             </tr>
           ))}
-          <tr className="font-bold bg-sky-100">
-            <td className={`${lab} bg-sky-100`}>Total</td>
+          <tr className="font-bold" style={tintePlanilla(COLORES_PLANILLA.envasado)}>
+            <td className={lab} style={{ background: "transparent" }}>Total Envasado</td>
             {P.fechas.map((f) => {
               const plan = P.envasado.reduce((s, e) => s + e.dias[f].plan, 0);
               const real = P.envasado.reduce((s, e) => s + e.dias[f].real, 0);
@@ -8882,9 +8888,9 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
             })}
           </tr>
 
-          <tr className="font-bold bg-sky-200">
-            <td className={`${lab} bg-sky-200`}>Lavado de Bandejas</td>
-            {P.fechas.map((f) => ["Lavados", "Rotos", "%Rot."].map((t) => <td key={f + t} className={`${td} bg-sky-200 text-center`}>{t}</td>))}
+          <tr className="font-bold">
+            <td className={`${lab} !whitespace-normal leading-tight`} style={bandaPlanilla(COLORES_PLANILLA.lavado)}>Lavado de Bandejas (en pallets)</td>
+            {P.fechas.map((f) => ["Lav.", "Rotos", "%Rot."].map((t) => <td key={f + t} className={`${td} text-center`} style={bandaPlanilla(COLORES_PLANILLA.lavado)}>{t}</td>))}
           </tr>
           {P.lavado.map((e) => (
             <tr key={e.turno}>
@@ -8899,8 +8905,8 @@ function TablaPlanilla({ datos, manual, desde, onDia, diaSel }) {
               })}
             </tr>
           ))}
-          <tr className="font-bold bg-sky-100">
-            <td className={`${lab} bg-sky-100`}>Total</td>
+          <tr className="font-bold" style={tintePlanilla(COLORES_PLANILLA.lavado)}>
+            <td className={lab} style={{ background: "transparent" }}>Total Lavado</td>
             {P.fechas.map((f) => {
               const lv = P.lavado.reduce((s, e) => s + e.dias[f].lav, 0);
               const rt = P.lavado.reduce((s, e) => s + e.dias[f].rot, 0);
