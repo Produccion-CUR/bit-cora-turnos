@@ -44,7 +44,15 @@ const inputBase =
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const num = (v) => (v === "" || v === undefined || v === null ? 0 : Number(v) || 0);
+// Convierte a número aceptando también el formato chileno con coma decimal
+// ("21818,34" → 21818.34 · "1.234,5" → 1234.5). Sin coma se usa tal cual.
+const num = (v) => {
+  if (v === "" || v === undefined || v === null) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  let t = String(v).trim();
+  if (t.includes(",")) t = t.replace(/\./g, "").replace(",", ".");
+  return Number(t) || 0;
+};
 
 // Formato de número estilo chileno: punto para miles, coma para decimales.
 // Ej: fmtNum(12345.6) -> "12.345,6" · fmtNum(950, 0) -> "950" · fmtNum(1234567) -> "1.234.567"
